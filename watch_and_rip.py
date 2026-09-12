@@ -155,19 +155,7 @@ def sanitize(name):
     return "".join(c for c in name if c not in '/\\:*?"<>|').strip()
 
 
-def handle_movie(raw_dir):
-    title = zenity_entry("Movie title:")
-    if not title:
-        notify("No title entered - aborting.")
-        return
-    year = zenity_entry("Release year:")
-    if not year:
-        notify("No year entered - aborting.")
-        return
-
-    title = sanitize(title)
-    year = sanitize(year)
-
+def handle_movie(raw_dir, title, year):
     # Find the ripped file with the longest runtime - almost always the movie itself
     mkv_files = list(Path(raw_dir).glob("*.mkv"))
     if not mkv_files:
@@ -188,19 +176,7 @@ def handle_movie(raw_dir):
     notify(f"Done! {folder_name} has been encoded and sent to the media server.")
 
 
-def handle_tv(raw_dir):
-    show_name = zenity_entry("Show name:")
-    if not show_name:
-        notify("No show name entered - aborting.")
-        return
-    show_name = sanitize(show_name)
-
-    season = zenity_entry("Season number (e.g. 1):")
-    if not season:
-        notify("No season entered - aborting.")
-        return
-    season_num = int(season)
-
+def handle_tv(raw_dir, show_name, season_num):
     mkv_files = sorted(Path(raw_dir).glob("*.mkv"), key=get_duration_seconds, reverse=True)
     if not mkv_files:
         notify("No files were ripped - check MakeMKV output.")
@@ -236,31 +212,64 @@ def handle_tv(raw_dir):
 
 def main():
     os.makedirs(cfg.WORK_DIR, exist_ok=True)
+    print("Disc ripper running. Press Ctrl+C to stop.")
 
-    while True:
-        device = wait_for_disc()
-        time.sleep(2)  # let the disc finish spinning up before MakeMKV touches it
+    try:
+        while True:
+            device = wait_for_disc()
+            time.sleep(2)  # let the disc finish spinning up before MakeMKV touches it
 
-        content_type = zenity_choice(
-            "What's on this disc?",
-            ["Movie", "TV Show"]
-        )
-        if not content_type:
+            content_type = zenity_choice(
+                "What's on this disc?",
+                ["Movie", "TV Show"]
+            )
+            if not content_type:
+                eject_disc(device)
+                continue
+
+            # Collect metadata up front, before the (long) rip runs.
+            if content_type == "Movie":
+                title = zenity_entry("Movie title:")
+                if not title:
+                    notify("No title entered - aborting.")
+                    eject_disc(device)
+                    continue
+                year = zenity_entry("Release year:")
+                if not year:
+                    notify("No year entered - aborting.")
+                    eject_disc(device)
+                    continue
+                title, year = sanitize(title), sanitize(year)
+            else:
+                show_name = zenity_entry("Show name:")
+                if not show_name:
+                    notify("No show name entered - aborting.")
+                    eject_disc(device)
+                    continue
+                show_name = sanitize(show_name)
+
+                season = zenity_entry("Season number (e.g. 1):")
+                if not season:
+                    notify("No season entered - aborting.")
+                    eject_disc(device)
+                    continue
+                season_num = int(season)
+
+            raw_dir = os.path.join(cfg.RAW_RIP_DIR, str(int(time.time())))
+            rip_disc(raw_dir)
+
+            if content_type == "Movie":
+                handle_movie(raw_dir, title, year)
+            else:
+                handle_tv(raw_dir, show_name, season_num)
+
+            # Clean up raw rip to save disk space now that encoding is done
+            shutil.rmtree(raw_dir, ignore_errors=True)
+
             eject_disc(device)
-            continue
-
-        raw_dir = os.path.join(cfg.RAW_RIP_DIR, str(int(time.time())))
-        rip_disc(raw_dir)
-
-        if content_type == "Movie":
-            handle_movie(raw_dir)
-        else:
-            handle_tv(raw_dir)
-
-        # Clean up raw rip to save disk space now that encoding is done
-        shutil.rmtree(raw_dir, ignore_errors=True)
-
-        eject_disc(device)
+    except KeyboardInterrupt:
+        print("\nCtrl+C received - shutting down.")
+        sys.exit(0)
 
 
 if __name__ == "__main__":
