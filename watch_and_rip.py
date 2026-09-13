@@ -30,7 +30,14 @@ import pyudev
 import config as cfg
 
 
-def notify(message, title="Disc Ripper"):
+def notify(message, title="Disc Ripper", device=None):
+    """Shows a blocking info dialog. If `device` is given, rings the bell and
+    ejects the disc right before the dialog appears, so the audible/physical
+    signal fires when the user's attention is actually needed - not after
+    they've already noticed and dismissed the dialog on their own."""
+    if device:
+        ring_bell()
+        eject_disc(device)
     subprocess.run(["zenity", "--info", "--text", message, "--title", title])
 
 
@@ -206,11 +213,11 @@ def prompt_required_int(prompt_text, field_label, device):
         return None
 
 
-def handle_movie(raw_dir, title, year):
+def handle_movie(raw_dir, title, year, device):
     # Find the ripped file with the longest runtime - almost always the movie itself
     mkv_files = list(Path(raw_dir).glob("*.mkv"))
     if not mkv_files:
-        notify("No files were ripped - check MakeMKV output.")
+        notify("No files were ripped - check MakeMKV output.", device=device)
         return
 
     mkv_files.sort(key=get_duration_seconds, reverse=True)
@@ -221,13 +228,13 @@ def handle_movie(raw_dir, title, year):
     encoded_path = Path(cfg.ENCODED_DIR) / folder_name / output_name
 
     if encode_and_send(main_file, encoded_path, f"{cfg.REMOTE_MOVIES_PATH}/{folder_name}", folder_name):
-        notify(f"Done! {folder_name} has been encoded and sent to the media server.")
+        notify(f"Done! {folder_name} has been encoded and sent to the media server.", device=device)
 
 
-def handle_tv(raw_dir, show_name, season_num):
+def handle_tv(raw_dir, show_name, season_num, device):
     mkv_files = sorted(Path(raw_dir).glob("*.mkv"), key=get_duration_seconds, reverse=True)
     if not mkv_files:
-        notify("No files were ripped - check MakeMKV output.")
+        notify("No files were ripped - check MakeMKV output.", device=device)
         return
 
     # Ask about every ripped title up front, so we know the total transfer
@@ -255,7 +262,7 @@ def handle_tv(raw_dir, show_name, season_num):
 
     total = len(episodes)
     if total == 0:
-        notify(f"No episodes selected for {show_name} - nothing to transfer.")
+        notify(f"No episodes selected for {show_name} - nothing to transfer.", device=device)
         return
 
     transferred = 0
@@ -268,7 +275,8 @@ def handle_tv(raw_dir, show_name, season_num):
         if encode_and_send(f, encoded_path, f"{cfg.REMOTE_TV_PATH}/{show_name}/{season_folder}", label):
             transferred += 1
 
-    notify(f"Done! {transferred} of {total} episode(s) for {show_name} transferred to the media server.")
+    notify(f"Done! {transferred} of {total} episode(s) for {show_name} transferred to the media server.",
+           device=device)
 
 
 def main():
@@ -312,19 +320,16 @@ def main():
                 rip_disc(raw_dir)
             except subprocess.CalledProcessError as e:
                 notify(f"MakeMKV failed (exit code {e.returncode}) - aborting this disc. "
-                       "Check the terminal for details.")
+                       "Check the terminal for details.", device=device)
                 print(f"Command failed: {e}", file=sys.stderr)
             else:
                 if content_type == "Movie":
-                    handle_movie(raw_dir, title, year)
+                    handle_movie(raw_dir, title, year, device)
                 else:
-                    handle_tv(raw_dir, show_name, season_num)
+                    handle_tv(raw_dir, show_name, season_num, device)
 
             # Clean up raw rip to save disk space now that encoding is done
             shutil.rmtree(raw_dir, ignore_errors=True)
-
-            ring_bell()
-            eject_disc(device)
     except KeyboardInterrupt:
         print("\nCtrl+C received - shutting down.")
         sys.exit(0)
