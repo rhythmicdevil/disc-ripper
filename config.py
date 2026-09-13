@@ -15,7 +15,7 @@ RAW_RIP_DIR = WORK_DIR + "/raw"          # MakeMKV output lands here
 ENCODED_DIR = WORK_DIR + "/encoded"      # FFmpeg output lands here
 
 # --- MakeMKV settings ---
-MAKEMKV_MIN_LENGTH_SECONDS = 1200        # 20 min - filters out trailers/junk titles
+MAKEMKV_MIN_LENGTH_SECONDS = 3900        # 65 min - filters out trailers/junk titles
                                           # Lower this (e.g. 300) if ripping TV discs
                                           # with short episodes.
 
