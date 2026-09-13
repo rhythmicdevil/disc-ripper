@@ -65,16 +65,27 @@ Leave the terminal open. Insert a disc:
   title is the movie itself (usually correct) and encodes just that one.
 - **TV Show**: enter the show name and season number, then for each ripped
   title you'll be asked if it's a real episode (so you can skip trailers/
-  recaps) and what episode number it is.
+  recaps) and what episode number it is. All of this happens up front, before
+  any encoding starts, so you can walk away once you've answered for every
+  ripped title.
 - The finished file(s) get encoded with your GPU (NVENC) and rsync'd
-  straight to the correct folder on the media server.
-- The disc ejects automatically when done.
+  straight to the correct folder on the media server. For TV discs, the
+  progress popup and final summary show a running count (e.g. "2 of 4")
+  against the total number of episodes you selected.
+- Once everything for that disc is finished (or has failed and been
+  reported), the script rings the terminal bell twice and ejects the disc —
+  so you get both an audible and a physical signal that it's done, even if
+  you've stepped away.
 
 Insert the next disc and repeat — the script loops forever until you
 Ctrl+C it.
 
 ## Notes / things to double check
 
+- **No sound on completion?**: the "done" chime is the plain terminal bell
+  (`\a`). Some terminal emulators mute it by default or show a visual flash
+  instead — check your terminal's "bell"/"audible bell" preference if you
+  don't hear it, or just rely on the disc ejecting.
 - **Movie title matching**: the script picks the single longest ripped
   title as "the movie." For most single-feature discs this is right, but
   double-check the result against Jellyfin after a few rips to be sure.

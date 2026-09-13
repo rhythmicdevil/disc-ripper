@@ -108,9 +108,9 @@ def get_duration_seconds(filepath):
         return 0.0
 
 
-def encode_file(input_path, output_path):
+def encode_file(input_path, output_path, label=None):
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    progress = zenity_progress_pulse(f"Encoding {os.path.basename(output_path)}...")
+    progress = zenity_progress_pulse(f"Encoding {label or os.path.basename(output_path)}...")
     try:
         subprocess.run(
             [
@@ -147,12 +147,63 @@ def cleanup_encoded_file(encoded_path):
         parent = parent.parent
 
 
+def encode_and_send(local_path, encoded_path, remote_dir, item_label):
+    """Encodes one file and transfers it to the server. Returns True on
+    success; on any subprocess failure (ffmpeg/ssh/rsync), notifies the user
+    with details and returns False so the caller can skip this item and keep
+    going instead of taking down the whole watcher."""
+    try:
+        encode_file(local_path, encoded_path, label=item_label)
+        rsync_to_server(encoded_path, remote_dir)
+        cleanup_encoded_file(encoded_path)
+        return True
+    except subprocess.CalledProcessError as e:
+        notify(f"Failed to encode/send {item_label}: '{e.cmd[0]}' exited with "
+               f"code {e.returncode}. Skipping this file - check the terminal.")
+        print(f"Command failed for {item_label}: {e}", file=sys.stderr)
+        return False
+
+
 def eject_disc(device):
     subprocess.run(["eject", device])
 
 
+def ring_bell(times=2):
+    """Best-effort audible 'done' signal via the terminal bell. Combined with
+    the tray physically opening, this covers you whether you're watching the
+    drive or just listening from another room. Never raises - a muted
+    terminal bell shouldn't be treated as a pipeline failure."""
+    for _ in range(times):
+        print("\a", end="", flush=True)
+        time.sleep(0.3)
+
+
 def sanitize(name):
     return "".join(c for c in name if c not in '/\\:*?"<>|').strip()
+
+
+def prompt_required(prompt_text, field_label, device):
+    """Prompts for a value. On empty input, notifies, ejects the disc, and
+    returns None so the caller can abort this disc and continue the loop."""
+    value = zenity_entry(prompt_text)
+    if not value:
+        notify(f"No {field_label} entered - aborting.")
+        eject_disc(device)
+        return None
+    return value
+
+
+def prompt_required_int(prompt_text, field_label, device):
+    """Like prompt_required, but also validates the input parses as an int."""
+    value = prompt_required(prompt_text, field_label, device)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        notify(f"'{value}' isn't a valid number - aborting.")
+        eject_disc(device)
+        return None
 
 
 def handle_movie(raw_dir, title, year):
@@ -169,11 +220,8 @@ def handle_movie(raw_dir, title, year):
     output_name = f"{folder_name}.mkv"
     encoded_path = Path(cfg.ENCODED_DIR) / folder_name / output_name
 
-    encode_file(main_file, encoded_path)
-    rsync_to_server(encoded_path, f"{cfg.REMOTE_MOVIES_PATH}/{folder_name}")
-    cleanup_encoded_file(encoded_path)
-
-    notify(f"Done! {folder_name} has been encoded and sent to the media server.")
+    if encode_and_send(main_file, encoded_path, f"{cfg.REMOTE_MOVIES_PATH}/{folder_name}", folder_name):
+        notify(f"Done! {folder_name} has been encoded and sent to the media server.")
 
 
 def handle_tv(raw_dir, show_name, season_num):
@@ -182,6 +230,9 @@ def handle_tv(raw_dir, show_name, season_num):
         notify("No files were ripped - check MakeMKV output.")
         return
 
+    # Ask about every ripped title up front, so we know the total transfer
+    # count before encoding starts and can walk away for the whole batch.
+    episodes = []
     for f in mkv_files:
         duration_min = get_duration_seconds(f) / 60
         keep = zenity_choice(
@@ -194,20 +245,30 @@ def handle_tv(raw_dir, show_name, season_num):
         episode = zenity_entry(f"Episode number for {f.name} (e.g. 1):")
         if not episode:
             continue
-        episode_num = int(episode)
+        try:
+            episode_num = int(episode)
+        except ValueError:
+            notify(f"'{episode}' isn't a valid episode number - skipping {f.name}.")
+            continue
 
+        episodes.append((f, episode_num))
+
+    total = len(episodes)
+    if total == 0:
+        notify(f"No episodes selected for {show_name} - nothing to transfer.")
+        return
+
+    transferred = 0
+    for f, episode_num in episodes:
         season_folder = f"Season {season_num:02d}"
         episode_filename = f"{show_name} S{season_num:02d}E{episode_num:02d}.mkv"
         encoded_path = Path(cfg.ENCODED_DIR) / show_name / season_folder / episode_filename
 
-        encode_file(f, encoded_path)
-        rsync_to_server(
-            encoded_path,
-            f"{cfg.REMOTE_TV_PATH}/{show_name}/{season_folder}"
-        )
-        cleanup_encoded_file(encoded_path)
+        label = f"{episode_filename} ({transferred + 1} of {total})"
+        if encode_and_send(f, encoded_path, f"{cfg.REMOTE_TV_PATH}/{show_name}/{season_folder}", label):
+            transferred += 1
 
-    notify(f"Done! Episodes for {show_name} have been encoded and sent to the media server.")
+    notify(f"Done! {transferred} of {total} episode(s) for {show_name} transferred to the media server.")
 
 
 def main():
@@ -229,43 +290,40 @@ def main():
 
             # Collect metadata up front, before the (long) rip runs.
             if content_type == "Movie":
-                title = zenity_entry("Movie title:")
-                if not title:
-                    notify("No title entered - aborting.")
-                    eject_disc(device)
+                title = prompt_required("Movie title:", "title", device)
+                if title is None:
                     continue
-                year = zenity_entry("Release year:")
-                if not year:
-                    notify("No year entered - aborting.")
-                    eject_disc(device)
+                year = prompt_required("Release year:", "year", device)
+                if year is None:
                     continue
                 title, year = sanitize(title), sanitize(year)
             else:
-                show_name = zenity_entry("Show name:")
-                if not show_name:
-                    notify("No show name entered - aborting.")
-                    eject_disc(device)
+                show_name = prompt_required("Show name:", "show name", device)
+                if show_name is None:
                     continue
                 show_name = sanitize(show_name)
 
-                season = zenity_entry("Season number (e.g. 1):")
-                if not season:
-                    notify("No season entered - aborting.")
-                    eject_disc(device)
+                season_num = prompt_required_int("Season number (e.g. 1):", "season", device)
+                if season_num is None:
                     continue
-                season_num = int(season)
 
             raw_dir = os.path.join(cfg.RAW_RIP_DIR, str(int(time.time())))
-            rip_disc(raw_dir)
-
-            if content_type == "Movie":
-                handle_movie(raw_dir, title, year)
+            try:
+                rip_disc(raw_dir)
+            except subprocess.CalledProcessError as e:
+                notify(f"MakeMKV failed (exit code {e.returncode}) - aborting this disc. "
+                       "Check the terminal for details.")
+                print(f"Command failed: {e}", file=sys.stderr)
             else:
-                handle_tv(raw_dir, show_name, season_num)
+                if content_type == "Movie":
+                    handle_movie(raw_dir, title, year)
+                else:
+                    handle_tv(raw_dir, show_name, season_num)
 
             # Clean up raw rip to save disk space now that encoding is done
             shutil.rmtree(raw_dir, ignore_errors=True)
 
+            ring_bell()
             eject_disc(device)
     except KeyboardInterrupt:
         print("\nCtrl+C received - shutting down.")
