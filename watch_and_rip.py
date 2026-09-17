@@ -72,6 +72,29 @@ def zenity_progress_pulse(message, title="Disc Ripper"):
     )
 
 
+def ensure_all_subtitles_selected():
+    """Makes sure MakeMKV never skips a subtitle track based on language.
+
+    Out of the box, MakeMKV's default track-selection rule
+    (app_DefaultSelectionString) only auto-selects audio/subtitle tracks in
+    your preferred language or with no language tag - foreign-language
+    subtitle tracks get silently left out of the rip. This overrides that
+    rule (in ~/.MakeMKV/settings.conf) to always include every subtitle
+    track regardless of language, while leaving MakeMKV's normal
+    language-based filtering for audio tracks untouched. Idempotent - safe
+    to call on every run."""
+    key = "app_DefaultSelectionString"
+    selection_string = "-sel:all,+sel:(favlang|nolang|subtitle),-sel:mvcvideo"
+
+    settings_path = Path.home() / ".MakeMKV" / "settings.conf"
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+
+    lines = settings_path.read_text().splitlines() if settings_path.exists() else []
+    lines = [line for line in lines if not line.strip().startswith(key)]
+    lines.append(f'{key} = "{selection_string}"')
+    settings_path.write_text("\n".join(lines) + "\n")
+
+
 def wait_for_disc():
     """Blocks until an optical disc is inserted. Returns the device node."""
     context = pyudev.Context()
@@ -88,7 +111,8 @@ def wait_for_disc():
 
 
 def rip_disc(raw_out_dir):
-    """Runs makemkvcon to rip all titles over the min-length threshold."""
+    """Runs makemkvcon to rip all titles over the min-length threshold.
+    Used for TV rips, where we don't know upfront which titles are episodes."""
     os.makedirs(raw_out_dir, exist_ok=True)
     progress = zenity_progress_pulse("Ripping disc with MakeMKV — this can take a while...")
     try:
@@ -101,6 +125,106 @@ def rip_disc(raw_out_dir):
         )
     finally:
         progress.terminate()
+
+
+def rip_title(raw_out_dir, title_index):
+    """Runs makemkvcon to rip a single, already-chosen title. Used for movies,
+    where we pick the main feature from the disc's title list before ripping
+    instead of ripping every long title and sorting afterward."""
+    os.makedirs(raw_out_dir, exist_ok=True)
+    progress = zenity_progress_pulse("Ripping disc with MakeMKV — this can take a while...")
+    try:
+        subprocess.run(
+            ["makemkvcon", "mkv", "disc:0", str(title_index), raw_out_dir],
+            check=True,
+        )
+    finally:
+        progress.terminate()
+
+
+def parse_makemkv_duration(value):
+    """Parses a MakeMKV robot-mode duration like '1:32:14' (H:MM:SS) into seconds."""
+    try:
+        parts = [int(p) for p in value.split(":")]
+    except ValueError:
+        return 0
+    seconds = 0
+    for p in parts:
+        seconds = seconds * 60 + p
+    return seconds
+
+
+def get_disc_titles(disc_num=0):
+    """Queries MakeMKV's title list for the disc (name + duration per title)
+    without ripping anything - just reads the disc structure, so it's fast.
+    Returns {title_index: {"name": str, "duration_seconds": float}}."""
+    result = subprocess.run(
+        ["makemkvcon", "-r", "info", f"disc:{disc_num}"],
+        capture_output=True, text=True, check=True,
+    )
+    titles = {}
+    for line in result.stdout.splitlines():
+        if not line.startswith("TINFO:"):
+            continue
+        # TINFO:<title_index>,<attribute_id>,<code>,"<value>" - split(maxsplit=3)
+        # so commas inside a quoted value (e.g. a title name) aren't mis-split.
+        parts = line[len("TINFO:"):].split(",", 3)
+        if len(parts) < 4:
+            continue
+        index_str, attr_id_str, _code, value = parts
+        try:
+            index, attr_id = int(index_str), int(attr_id_str)
+        except ValueError:
+            continue
+        value = value.strip().strip('"')
+
+        title = titles.setdefault(index, {})
+        if attr_id == 9:  # Duration
+            title["duration_seconds"] = parse_makemkv_duration(value)
+        elif attr_id == 2:  # Name
+            title["name"] = value
+    return titles
+
+
+def choose_main_title(titles, device):
+    """Picks the disc title index to rip as the movie. Auto-picks the longest
+    title over the min-length threshold when there's a single clear winner.
+    If nothing clears the threshold, or two+ titles tie for longest (runtime
+    alone can't disambiguate - e.g. a theatrical/extended pair, or duplicate
+    angle/audio encodes), notifies the user and lets them pick instead of
+    guessing wrong. Returns None if there's nothing to rip or the user didn't
+    choose - the disc has already been ejected by the time this returns None."""
+    candidates = {
+        idx: info for idx, info in titles.items()
+        if info.get("duration_seconds", 0) >= cfg.MAKEMKV_MIN_LENGTH_SECONDS
+    }
+    if not candidates:
+        notify("MakeMKV didn't find any titles over the minimum length on "
+               "this disc - aborting.", device=device)
+        return None
+
+    by_duration = sorted(candidates.items(), key=lambda kv: kv[1]["duration_seconds"], reverse=True)
+    longest = by_duration[0][1]["duration_seconds"]
+    tied = [idx for idx, info in by_duration if info["duration_seconds"] == longest]
+
+    if len(tied) == 1:
+        return by_duration[0][0]
+
+    # Don't eject here - the disc is still needed to actually rip the chosen title.
+    notify("MakeMKV found multiple titles of the same length - couldn't "
+           "automatically pick the main feature. Pick it on the next screen.")
+
+    options = []
+    for idx, info in by_duration:
+        minutes = info["duration_seconds"] / 60
+        name = info.get("name", "")
+        options.append(f"Title {idx} - {minutes:.0f} min" + (f" ({name})" if name else ""))
+
+    choice = zenity_choice("Multiple titles are the same length - which one is the movie?", options)
+    if not choice:
+        notify("No title selected - aborting.", device=device)
+        return None
+    return int(choice.split()[1])
 
 
 def get_duration_seconds(filepath):
@@ -281,6 +405,7 @@ def handle_tv(raw_dir, show_name, season_num, device):
 
 def main():
     os.makedirs(cfg.WORK_DIR, exist_ok=True)
+    ensure_all_subtitles_selected()
     print("Disc ripper running. Press Ctrl+C to stop.")
 
     try:
@@ -317,7 +442,14 @@ def main():
 
             raw_dir = os.path.join(cfg.RAW_RIP_DIR, str(int(time.time())))
             try:
-                rip_disc(raw_dir)
+                if content_type == "Movie":
+                    titles = get_disc_titles()
+                    title_index = choose_main_title(titles, device)
+                    if title_index is None:
+                        continue
+                    rip_title(raw_dir, title_index)
+                else:
+                    rip_disc(raw_dir)
             except subprocess.CalledProcessError as e:
                 notify(f"MakeMKV failed (exit code {e.returncode}) - aborting this disc. "
                        "Check the terminal for details.", device=device)
