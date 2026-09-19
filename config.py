@@ -7,7 +7,7 @@ import os
 
 # --- Media server (rsync target) ---
 SSH_USER = "swright"
-SSH_HOST = "media"                       # or media.tail689c7d.ts.net if off-LAN
+SSH_HOST = "media"                       # use the off-LAN hostname/IP here if needed
 REMOTE_MOVIES_PATH = "/mnt/storage/movies"
 REMOTE_TV_PATH = "/mnt/storage/tv"
 
