@@ -28,3 +28,9 @@ AUDIO_BITRATE = "192k"
 
 # --- Optical drive device (adjust if you have more than one / different path) ---
 OPTICAL_DEVICE = "/dev/sr0"
+
+# --- TMDB (episode name lookup for TV rips) ---
+# Free account + API key at https://www.themoviedb.org/settings/api
+# Leave blank to skip episode-name lookup (files are named "Show SxxExx.mkv"
+# with no title suffix).
+TMDB_API_KEY = ""

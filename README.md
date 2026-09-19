@@ -48,6 +48,10 @@ Open `config.py` and confirm:
 - `REMOTE_MOVIES_PATH` / `REMOTE_TV_PATH` match your actual mount points
 - `WORK_DIR` has enough free disk space for raw rips (Blu-ray rips can be
   20-30GB before encoding)
+- `TMDB_API_KEY` (optional) — a free API key from
+  https://www.themoviedb.org/settings/api. Enables episode-name lookup for
+  TV rips (e.g. "S01E01 - Welcome to the Hellmouth"). Leave blank to skip
+  it — episodes are still named `Show SxxExx.mkv` with no title.
 
 ## Running it
 
@@ -65,9 +69,20 @@ Leave the terminal open. Insert a disc:
   title is the movie itself (usually correct) and encodes just that one.
 - **TV Show**: enter the show name and season number, then for each ripped
   title you'll be asked if it's a real episode (so you can skip trailers/
-  recaps) and what episode number it is. All of this happens up front, before
-  any encoding starts, so you can walk away once you've answered for every
-  ripped title.
+  recaps) and what episode number it is. The episode number field is
+  pre-filled with a guess, derived from (in priority order) the disc's title
+  order, the disc source filename's sequence number, and the title's chapter
+  count — the prompt tells you the guess's confidence and why, so you know
+  whether to just confirm or double-check it. None of these signals are
+  fully reliable on their own (discs get authored in all kinds of orders),
+  so it's always a starting point you can edit, never assumed to be correct.
+  All of this happens up front, before any encoding starts, so you can walk
+  away once you've answered for every ripped title.
+  Once a number is confirmed, if `TMDB_API_KEY` is set in `config.py` the
+  script looks up that episode's title on TMDB and appends it to the
+  filename (e.g. `Buffy the Vampire Slayer S01E01 - Welcome to the
+  Hellmouth.mkv`). If the lookup fails or isn't configured, the file is just
+  named `Show SxxExx.mkv` as before.
 - The finished file(s) get encoded with your GPU (NVENC) and rsync'd
   straight to the correct folder on the media server. For TV discs, the
   progress popup and final summary show a running count (e.g. "2 of 4")
@@ -93,9 +108,15 @@ Ctrl+C it.
   title that's longer than the actual movie (concatenates it with something
   else). If a movie comes out with a suspiciously long runtime, check the
   raw MakeMKV output folder before trusting the automation blindly.
-- **TV numbering**: MakeMKV title order doesn't necessarily match episode
-  order. Look up the actual episode list/order before naming, same as we
-  discussed for Legend of Korra.
+- **TV numbering**: the episode-number prompt is now pre-filled with a
+  guess (disc title order, cross-checked against source filename and
+  chapter count) and tells you its confidence — but MakeMKV title order
+  still doesn't *necessarily* match episode order, so treat "high
+  confidence" as "probably right," not "definitely right." Worth
+  double-checking against the actual episode list for anything with
+  bonus features, double-length episodes, or a disc that starts mid-season
+  (the guess always assumes disc 1 = episode 1), same as we discussed for
+  Legend of Korra.
 - **Naming conventions**: this matches what we set up for Jellyfin —
   `Title (Year)/Title (Year).mkv` for movies, `Show/Season NN/Show SxxExx.mkv`
   for TV.

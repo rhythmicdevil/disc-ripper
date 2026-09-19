@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # /// script
-# dependencies = ["pyudev"]
+# dependencies = ["pyudev", "requests"]
 # ///
 """
 watch_and_rip.py
@@ -18,6 +18,7 @@ Requires: makemkv-bin (or makemkv), ffmpeg, ffprobe, zenity, rsync, pyudev
 """
 
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -26,6 +27,7 @@ import time
 from pathlib import Path
 
 import pyudev
+import requests
 
 import config as cfg
 
@@ -41,11 +43,11 @@ def notify(message, title="Disc Ripper", device=None):
     subprocess.run(["zenity", "--info", "--text", message, "--title", title])
 
 
-def zenity_entry(prompt, title="Disc Ripper"):
-    result = subprocess.run(
-        ["zenity", "--entry", "--text", prompt, "--title", title],
-        capture_output=True, text=True
-    )
+def zenity_entry(prompt, title="Disc Ripper", default_text=None):
+    cmd = ["zenity", "--entry", "--text", prompt, "--title", title]
+    if default_text is not None:
+        cmd.append(f"--entry-text={default_text}")
+    result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         return None
     return result.stdout.strip()
@@ -155,9 +157,12 @@ def parse_makemkv_duration(value):
 
 
 def get_disc_titles(disc_num=0):
-    """Queries MakeMKV's title list for the disc (name + duration per title)
-    without ripping anything - just reads the disc structure, so it's fast.
-    Returns {title_index: {"name": str, "duration_seconds": float}}."""
+    """Queries MakeMKV's title list for the disc (name, duration, chapter
+    count, and source filename per title) without ripping anything - just
+    reads the disc structure, so it's fast. Title indices are returned in
+    MakeMKV's own order, which is normally the disc's authoring order.
+    Returns {title_index: {"name": str, "duration_seconds": float,
+    "chapter_count": int|None, "source_filename": str|None}}."""
     result = subprocess.run(
         ["makemkvcon", "-r", "info", f"disc:{disc_num}"],
         capture_output=True, text=True, check=True,
@@ -183,6 +188,10 @@ def get_disc_titles(disc_num=0):
             title["duration_seconds"] = parse_makemkv_duration(value)
         elif attr_id == 2:  # Name
             title["name"] = value
+        elif attr_id == 8:  # Chapter count
+            title["chapter_count"] = int(value) if value.isdigit() else None
+        elif attr_id == 16:  # Source filename (e.g. VTS_04_1.VOB or 00003.mpls)
+            title["source_filename"] = value
     return titles
 
 
@@ -225,6 +234,133 @@ def choose_main_title(titles, device):
         notify("No title selected - aborting.", device=device)
         return None
     return int(choice.split()[1])
+
+
+TITLE_INDEX_RE = re.compile(r"_t(\d+)\.mkv$", re.IGNORECASE)
+
+
+def source_file_number(source_filename):
+    """Pulls the meaningful sequence number out of a disc source filename:
+    the titleset number from a DVD name like 'VTS_04_1.VOB' (-> 4), or the
+    playlist/clip number from a Blu-ray name like '00003.mpls' (-> 3).
+    Authoring tools generally number these sequentially in authoring order,
+    which is often - not always - episode order. Returns None if the
+    filename doesn't match either pattern, so callers can treat it as
+    "no signal" rather than guessing wrong."""
+    if not source_filename:
+        return None
+    match = re.match(r"VTS_(\d+)_", source_filename, re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+    match = re.match(r"(\d+)\.\w+$", source_filename)
+    return int(match.group(1)) if match else None
+
+
+def guess_episode_order(mkv_files, titles):
+    """Guesses each ripped file's position in episode order. Ordering
+    itself always comes from the disc's title order (the order MakeMKV
+    lists titles in, recovered here from MakeMKV's default '..._t<NN>.mkv'
+    output naming). The source filename's sequence number and the title's
+    chapter count are used only as cross-checks that downgrade confidence
+    when they disagree - discs get authored in all kinds of orders, so this
+    is a starting guess for the user to confirm or correct, never a final
+    answer.
+
+    Returns a list of (path, guessed_offset, confidence, reason) - one
+    entry per file in mkv_files, ordered by the guess (files MakeMKV's
+    naming couldn't be matched to a title go last, sorted by duration).
+    guessed_offset is 0-based (add 1 for an episode number assuming this
+    disc starts at episode 1); it's None when nothing could be guessed."""
+    matched = []
+    unmatched = []
+    for f in mkv_files:
+        m = TITLE_INDEX_RE.search(f.name)
+        if m is None:
+            unmatched.append(f)
+            continue
+        title_index = int(m.group(1))
+        info = titles.get(title_index, {})
+        matched.append({
+            "path": f,
+            "title_index": title_index,
+            "source_number": source_file_number(info.get("source_filename")),
+            "chapter_count": info.get("chapter_count"),
+        })
+
+    matched.sort(key=lambda c: c["title_index"])
+
+    source_numbers = [c["source_number"] for c in matched]
+    source_order_known = all(n is not None for n in source_numbers)
+    source_order_agrees = source_order_known and source_numbers == sorted(source_numbers)
+
+    chapter_counts = [c["chapter_count"] for c in matched if c["chapter_count"]]
+    mode_chapter_count = max(set(chapter_counts), key=chapter_counts.count) if chapter_counts else None
+
+    results = []
+    for offset, c in enumerate(matched):
+        reasons = ["disc title order"]
+        confidence = "high"
+
+        if not source_order_known:
+            confidence = "medium"
+        elif source_order_agrees:
+            reasons.append("agrees with disc file order")
+        else:
+            confidence = "low"
+            reasons.append("disagrees with disc file order")
+
+        if mode_chapter_count is not None and c["chapter_count"] not in (None, mode_chapter_count):
+            confidence = "low"
+            reasons.append(
+                f"chapter count ({c['chapter_count']}) differs from the "
+                f"other {mode_chapter_count}-chapter episodes"
+            )
+
+        results.append((c["path"], offset, confidence, ", ".join(reasons)))
+
+    unmatched.sort(key=get_duration_seconds, reverse=True)
+    for f in unmatched:
+        results.append((f, None, "low", "couldn't match this file back to a disc title"))
+
+    return results
+
+
+def tmdb_get(path, params=None):
+    """Minimal TMDB v3 API GET helper. Returns the parsed JSON body, or None
+    on any failure - no API key configured, network error, non-2xx response
+    - so callers fall back to skipping the episode name instead of failing
+    the whole rip over a metadata lookup."""
+    if not cfg.TMDB_API_KEY:
+        return None
+    try:
+        response = requests.get(
+            f"https://api.themoviedb.org/3{path}",
+            params={**(params or {}), "api_key": cfg.TMDB_API_KEY},
+            timeout=10,
+        )
+        response.raise_for_status()
+        return response.json()
+    except requests.RequestException:
+        return None
+
+
+def tmdb_find_show_id(show_name):
+    """Looks up a TV show's TMDB id by name. Returns None if it can't be
+    found (or TMDB isn't configured/reachable) - callers should treat that
+    as "no episode names available" rather than an error."""
+    data = tmdb_get("/search/tv", {"query": show_name})
+    results = (data or {}).get("results") or []
+    return results[0]["id"] if results else None
+
+
+def tmdb_get_episode_title(show_id, season_num, episode_num):
+    """Looks up one episode's title on TMDB. Returns None if the show id is
+    unknown, the season/episode doesn't exist, or the lookup otherwise
+    fails - callers should fall back to a filename with no episode title."""
+    if show_id is None:
+        return None
+    data = tmdb_get(f"/tv/{show_id}/season/{season_num}/episode/{episode_num}")
+    return (data or {}).get("name") or None
 
 
 def get_duration_seconds(filepath):
@@ -355,16 +491,25 @@ def handle_movie(raw_dir, title, year, device):
         notify(f"Done! {folder_name} has been encoded and sent to the media server.", device=device)
 
 
-def handle_tv(raw_dir, show_name, season_num, device):
-    mkv_files = sorted(Path(raw_dir).glob("*.mkv"), key=get_duration_seconds, reverse=True)
+def handle_tv(raw_dir, show_name, season_num, device, titles):
+    mkv_files = list(Path(raw_dir).glob("*.mkv"))
     if not mkv_files:
         notify("No files were ripped - check MakeMKV output.", device=device)
         return
 
+    guesses = guess_episode_order(mkv_files, titles)
+    # Looked up once per disc rather than per episode - it's the same show
+    # for every file, no need to hit TMDB's search endpoint repeatedly.
+    show_id = tmdb_find_show_id(show_name)
+
     # Ask about every ripped title up front, so we know the total transfer
     # count before encoding starts and can walk away for the whole batch.
+    # The episode number field is pre-filled with a guess (from disc title
+    # order, cross-checked against source filename and chapter count - see
+    # guess_episode_order) so most discs just need a confirming click
+    # instead of typing every number by hand.
     episodes = []
-    for f in mkv_files:
+    for f, offset, confidence, reason in guesses:
         duration_min = get_duration_seconds(f) / 60
         keep = zenity_choice(
             f"File: {f.name}\nDuration: {duration_min:.0f} min\n\nIs this an episode?",
@@ -373,7 +518,15 @@ def handle_tv(raw_dir, show_name, season_num, device):
         if not keep or keep.startswith("No"):
             continue
 
-        episode = zenity_entry(f"Episode number for {f.name} (e.g. 1):")
+        guessed_num = offset + 1 if offset is not None else None
+        if guessed_num is not None:
+            hint = f"\n\nGuessed episode {guessed_num} ({confidence} confidence: {reason})."
+        else:
+            hint = f"\n\nCouldn't guess a number ({reason})."
+        episode = zenity_entry(
+            f"Episode number for {f.name} (e.g. 1):{hint}",
+            default_text=guessed_num,
+        )
         if not episode:
             continue
         try:
@@ -391,8 +544,13 @@ def handle_tv(raw_dir, show_name, season_num, device):
 
     transferred = 0
     for f, episode_num in episodes:
+        # Only look up the episode title once the number is confirmed -
+        # there's no point querying TMDB for a number that might still change.
+        episode_title = tmdb_get_episode_title(show_id, season_num, episode_num)
+        title_suffix = f" - {sanitize(episode_title)}" if episode_title else ""
+
         season_folder = f"Season {season_num:02d}"
-        episode_filename = f"{show_name} S{season_num:02d}E{episode_num:02d}.mkv"
+        episode_filename = f"{show_name} S{season_num:02d}E{episode_num:02d}{title_suffix}.mkv"
         encoded_path = Path(cfg.ENCODED_DIR) / show_name / season_folder / episode_filename
 
         label = f"{episode_filename} ({transferred + 1} of {total})"
@@ -441,9 +599,9 @@ def main():
                     continue
 
             raw_dir = os.path.join(cfg.RAW_RIP_DIR, str(int(time.time())))
+            titles = get_disc_titles()
             try:
                 if content_type == "Movie":
-                    titles = get_disc_titles()
                     title_index = choose_main_title(titles, device)
                     if title_index is None:
                         continue
@@ -458,7 +616,7 @@ def main():
                 if content_type == "Movie":
                     handle_movie(raw_dir, title, year, device)
                 else:
-                    handle_tv(raw_dir, show_name, season_num, device)
+                    handle_tv(raw_dir, show_name, season_num, device, titles)
 
             # Clean up raw rip to save disk space now that encoding is done
             shutil.rmtree(raw_dir, ignore_errors=True)
