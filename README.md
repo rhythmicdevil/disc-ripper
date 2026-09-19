@@ -72,14 +72,23 @@ python3 watch_and_rip.py
 
 Leave the terminal open. Insert a disc:
 - A popup asks if it's a **Movie** or **TV Show**
-- MakeMKV rips all titles over the minimum length (configurable in
-  `config.py` — defaults to 20 minutes, lower it for TV discs with short
-  episodes)
-- **Movie**: enter title + year. The script assumes the *longest* ripped
-  title is the movie itself (usually correct) and encodes just that one.
-- **TV Show**: enter the show name and season number, then for each ripped
-  title you'll be asked if it's a real episode (so you can skip trailers/
-  recaps) and what episode number it is. The episode number field is
+- **Movie**: enter title + year. MakeMKV rips every title over the minimum
+  length (`MAKEMKV_MIN_LENGTH_SECONDS` in `config.py`, defaults to 65 min),
+  and the script assumes the *longest* one is the movie itself (usually
+  correct) and encodes just that one.
+- **TV Show**: enter the show name and season number, then the approximate
+  **episode length in minutes**. That length becomes the center of a range
+  (± `EPISODE_LENGTH_PAD_MINUTES` in `config.py`, default 2 min — you're
+  asked at rip time whether to use that default or a custom padding), and
+  only disc titles whose duration falls in that range get ripped as episode
+  candidates. This is what keeps a "Play All" compilation title (much
+  longer than any single episode) from being mistaken for an episode, or
+  even ripped at all — the old fixed minimum-length filter was tuned for
+  movies and let compilations like that through as the *only* thing that
+  cleared the threshold.
+  Then, for each ripped title you'll be asked if it's a real episode (so you
+  can still skip anything unexpected that landed in the range) and what
+  episode number it is. The episode number field is
   pre-filled with a guess, derived from (in priority order) the disc's title
   order, the disc source filename's sequence number, and the title's chapter
   count — the prompt tells you the guess's confidence and why, so you know
@@ -118,6 +127,12 @@ Ctrl+C it.
   title that's longer than the actual movie (concatenates it with something
   else). If a movie comes out with a suspiciously long runtime, check the
   raw MakeMKV output folder before trusting the automation blindly.
+- **TV episode-length range**: if you enter a length that's off, or use too
+  narrow a padding, real episodes can fall outside the range and get
+  skipped entirely (nothing to select them from afterward, since they were
+  never ripped). If a disc comes up with fewer episodes than expected,
+  re-check the length/padding you entered before assuming something else
+  is wrong.
 - **TV numbering**: the episode-number prompt is now pre-filled with a
   guess (disc title order, cross-checked against source filename and
   chapter count) and tells you its confidence — but MakeMKV title order

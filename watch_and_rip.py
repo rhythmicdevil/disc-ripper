@@ -112,19 +112,23 @@ def wait_for_disc():
             return device.device_node
 
 
-def rip_disc(raw_out_dir):
-    """Runs makemkvcon to rip all titles over the min-length threshold.
-    Used for TV rips, where we don't know upfront which titles are episodes."""
+def rip_titles(raw_out_dir, title_indices):
+    """Rips a specific set of already-chosen disc titles, one at a time.
+    Used for TV, where candidate titles are picked in Python beforehand by
+    matching duration against a user-supplied episode-length range (see
+    choose_episode_length_range) - so a "Play All" compilation title (much
+    longer than any single episode) never gets ripped in the first place,
+    instead of being ripped and then having to be filtered out by hand."""
     os.makedirs(raw_out_dir, exist_ok=True)
-    progress = zenity_progress_pulse("Ripping disc with MakeMKV — this can take a while...")
+    progress = zenity_progress_pulse(
+        f"Ripping {len(title_indices)} title(s) with MakeMKV — this can take a while..."
+    )
     try:
-        subprocess.run(
-            [
-                "makemkvcon", "mkv", "disc:0", "all", raw_out_dir,
-                f"--minlength={cfg.MAKEMKV_MIN_LENGTH_SECONDS}",
-            ],
-            check=True,
-        )
+        for title_index in title_indices:
+            subprocess.run(
+                ["makemkvcon", "mkv", "disc:0", str(title_index), raw_out_dir],
+                check=True,
+            )
     finally:
         progress.terminate()
 
@@ -473,6 +477,43 @@ def prompt_required_int(prompt_text, field_label, device):
         return None
 
 
+def choose_episode_length_range(device):
+    """Asks for the approximate episode length and turns it into a
+    (min_seconds, max_seconds) window used to pick which disc titles get
+    ripped as episodes - the input length is the center of the range, and a
+    padding (default cfg.EPISODE_LENGTH_PAD_MINUTES, overridable here) sets
+    how wide it is on each side. Using a range instead of a bare minimum
+    means a "Play All" compilation title (much longer than any one episode)
+    is naturally excluded, instead of being the only title that clears a
+    minimum-length filter tuned for movies. Returns None if the user
+    cancels any prompt (the disc has already been ejected by then)."""
+    length_min = prompt_required_int(
+        "Approximate episode length in minutes (e.g. 23):", "episode length", device
+    )
+    if length_min is None:
+        return None
+
+    default_pad = cfg.EPISODE_LENGTH_PAD_MINUTES
+    choice = zenity_choice(
+        f"Match episodes within {default_pad} minutes of that length "
+        f"({length_min - default_pad}-{length_min + default_pad} min), "
+        "or set a custom padding?",
+        [f"Use default (±{default_pad} min)", "Set custom padding"],
+    )
+    if not choice:
+        return None
+
+    pad_min = default_pad
+    if choice.startswith("Set custom"):
+        pad_min = prompt_required_int("Padding in minutes (e.g. 2):", "padding", device)
+        if pad_min is None:
+            return None
+
+    min_seconds = max(0, (length_min - pad_min) * 60)
+    max_seconds = (length_min + pad_min) * 60
+    return min_seconds, max_seconds
+
+
 def handle_movie(raw_dir, title, year, device):
     # Find the ripped file with the longest runtime - almost always the movie itself
     mkv_files = list(Path(raw_dir).glob("*.mkv"))
@@ -598,6 +639,10 @@ def main():
                 if season_num is None:
                     continue
 
+                episode_range = choose_episode_length_range(device)
+                if episode_range is None:
+                    continue
+
             raw_dir = os.path.join(cfg.RAW_RIP_DIR, str(int(time.time())))
             titles = get_disc_titles()
             try:
@@ -607,7 +652,16 @@ def main():
                         continue
                     rip_title(raw_dir, title_index)
                 else:
-                    rip_disc(raw_dir)
+                    min_seconds, max_seconds = episode_range
+                    episode_indices = sorted(
+                        idx for idx, info in titles.items()
+                        if min_seconds <= info.get("duration_seconds", 0) <= max_seconds
+                    )
+                    if not episode_indices:
+                        notify("No titles on this disc matched the expected episode "
+                               "length - aborting.", device=device)
+                        continue
+                    rip_titles(raw_dir, episode_indices)
             except subprocess.CalledProcessError as e:
                 notify(f"MakeMKV failed (exit code {e.returncode}) - aborting this disc. "
                        "Check the terminal for details.", device=device)

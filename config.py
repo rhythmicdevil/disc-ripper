@@ -17,9 +17,16 @@ RAW_RIP_DIR = WORK_DIR + "/raw"          # MakeMKV output lands here
 ENCODED_DIR = WORK_DIR + "/encoded"      # FFmpeg output lands here
 
 # --- MakeMKV settings ---
-MAKEMKV_MIN_LENGTH_SECONDS = 3900        # 65 min - filters out trailers/junk titles
-                                          # Lower this (e.g. 300) if ripping TV discs
-                                          # with short episodes.
+# Movie-only: filters out trailers/junk titles when picking the main feature.
+# TV rips instead ask for an expected episode length per disc and use that
+# as a range (see EPISODE_LENGTH_PAD_MINUTES below), since a single minimum
+# can't tell a short episode apart from a "Play All" compilation title.
+MAKEMKV_MIN_LENGTH_SECONDS = 3900        # 65 min
+
+# Default +/- padding (in minutes) around the episode length you enter for
+# a TV rip, used to decide which disc titles are ripped as episodes. You're
+# asked at rip time whether to use this default or a custom padding instead.
+EPISODE_LENGTH_PAD_MINUTES = 2
 
 # --- FFmpeg / NVENC encode settings ---
 # RTX 3080 Max-Q supports NVENC hardware encoding.
