@@ -3,6 +3,8 @@ Configuration for the disc ripping / encoding / transfer pipeline.
 Edit these values for your environment.
 """
 
+import os
+
 # --- Media server (rsync target) ---
 SSH_USER = "swright"
 SSH_HOST = "media"                       # or media.tail689c7d.ts.net if off-LAN
@@ -31,6 +33,7 @@ OPTICAL_DEVICE = "/dev/sr0"
 
 # --- TMDB (episode name lookup for TV rips) ---
 # Free account + API key at https://www.themoviedb.org/settings/api
-# Leave blank to skip episode-name lookup (files are named "Show SxxExx.mkv"
+# Set via the TMDB_API_KEY environment variable (never committed to git).
+# Leave unset to skip episode-name lookup (files are named "Show SxxExx.mkv"
 # with no title suffix).
-TMDB_API_KEY = ""
+TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "")

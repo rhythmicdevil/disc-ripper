@@ -48,10 +48,20 @@ Open `config.py` and confirm:
 - `REMOTE_MOVIES_PATH` / `REMOTE_TV_PATH` match your actual mount points
 - `WORK_DIR` has enough free disk space for raw rips (Blu-ray rips can be
   20-30GB before encoding)
-- `TMDB_API_KEY` (optional) — a free API key from
-  https://www.themoviedb.org/settings/api. Enables episode-name lookup for
-  TV rips (e.g. "S01E01 - Welcome to the Hellmouth"). Leave blank to skip
-  it — episodes are still named `Show SxxExx.mkv` with no title.
+
+Also, optionally, set the `TMDB_API_KEY` environment variable to a free API
+key from https://www.themoviedb.org/settings/api. This enables episode-name
+lookup for TV rips (e.g. "S01E01 - Welcome to the Hellmouth"). It's read
+from the environment (not `config.py`) so the key never ends up in git —
+add it to your shell profile:
+
+```bash
+echo 'export TMDB_API_KEY="your-key-here"' >> ~/.bashrc
+source ~/.bashrc
+```
+
+Leave it unset to skip episode-name lookup — episodes are still named
+`Show SxxExx.mkv` with no title.
 
 ## Running it
 
@@ -78,8 +88,8 @@ Leave the terminal open. Insert a disc:
   so it's always a starting point you can edit, never assumed to be correct.
   All of this happens up front, before any encoding starts, so you can walk
   away once you've answered for every ripped title.
-  Once a number is confirmed, if `TMDB_API_KEY` is set in `config.py` the
-  script looks up that episode's title on TMDB and appends it to the
+  Once a number is confirmed, if the `TMDB_API_KEY` environment variable is
+  set, the script looks up that episode's title on TMDB and appends it to the
   filename (e.g. `Buffy the Vampire Slayer S01E01 - Welcome to the
   Hellmouth.mkv`). If the lookup fails or isn't configured, the file is just
   named `Show SxxExx.mkv` as before.
