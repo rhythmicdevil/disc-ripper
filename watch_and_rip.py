@@ -390,6 +390,7 @@ def encode_file(input_path, output_path, label=None):
                 "-c:a", cfg.AUDIO_CODEC, "-b:a", cfg.AUDIO_BITRATE,
                 str(output_path),
             ],
+            stdin=subprocess.DEVNULL,
             check=True,
         )
     finally:
