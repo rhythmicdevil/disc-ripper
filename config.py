@@ -8,8 +8,8 @@ import os
 # --- Media server (rsync target) ---
 SSH_USER = "swright"
 SSH_HOST = "media"                       # use the off-LAN hostname/IP here if needed
-REMOTE_MOVIES_PATH = "/mnt/storage/movies"
-REMOTE_TV_PATH = "/mnt/storage/tv"
+REMOTE_MOVIES_PATH = "/mnt/nas/movies"
+REMOTE_TV_PATH = "/mnt/nas/tv"
 
 # --- Local working directories (scratch space on this laptop) ---
 WORK_DIR = "/home/swright/disc-ripper-workdir"
