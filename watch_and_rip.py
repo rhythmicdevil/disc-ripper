@@ -160,13 +160,64 @@ def parse_makemkv_duration(value):
     return seconds
 
 
+def get_makemkv_error_messages(stdout, min_code=5000):
+    """Extracts MakeMKV's own error-level messages (robot-mode 'MSG:' lines)
+    from raw makemkvcon output. By MakeMKV's own convention, codes below
+    5000 are informational disc-scan chatter ("Title #4 was added ...",
+    "Using direct disc access mode"), while 5000+ covers real failures
+    ("Failed to decode audio/video data for title #1 ...", "Failed to open
+    disc"). This matters because makemkvcon exits 0 even when it fails to
+    open a disc entirely (one bad title can abort the whole scan and wipe
+    out every title it already found) - so a caller with an empty title
+    list has no way to tell "nothing on this disc" from "MakeMKV choked"
+    without reading these."""
+    messages = []
+    for line in stdout.splitlines():
+        if not line.startswith("MSG:"):
+            continue
+        # MSG:<code>,<flags>,<count>,"<formatted message>","<format>",... -
+        # split(maxsplit=3) so commas inside the message text aren't
+        # mis-split, same approach as the TINFO/TCOUNT parsing above.
+        parts = line[len("MSG:"):].split(",", 3)
+        if len(parts) < 4:
+            continue
+        code_str, _flags, _count, rest = parts
+        try:
+            code = int(code_str)
+        except ValueError:
+            continue
+        if code < min_code:
+            continue
+        # rest is '"<formatted message>","<format>",...<params>' - the
+        # formatted message is everything up to the '","' boundary before
+        # the format-string field.
+        message = rest.split('","', 1)[0].strip().strip('"')
+        if message and message not in messages:
+            messages.append(message)
+    return messages
+
+
+def format_makemkv_errors(error_messages):
+    """Formats MakeMKV's own error messages for appending to a zenity
+    notification. Returns '' when there's nothing to show, so callers can
+    always append the result without an extra if-check."""
+    if not error_messages:
+        return ""
+    return "\n\nMakeMKV reported:\n" + "\n".join(f"- {m}" for m in error_messages)
+
+
 def get_disc_titles(disc_num=0):
     """Queries MakeMKV's title list for the disc (name, duration, chapter
     count, and source filename per title) without ripping anything - just
     reads the disc structure, so it's fast. Title indices are returned in
     MakeMKV's own order, which is normally the disc's authoring order.
-    Returns {title_index: {"name": str, "duration_seconds": float,
-    "chapter_count": int|None, "source_filename": str|None}}."""
+    Returns a (titles, error_messages) tuple: titles is
+    {title_index: {"name": str, "duration_seconds": float,
+    "chapter_count": int|None, "source_filename": str|None}}; error_messages
+    is MakeMKV's own error-level output for this run (see
+    get_makemkv_error_messages) - empty titles plus a non-empty
+    error_messages means MakeMKV failed to open the disc, not that the disc
+    has nothing on it."""
     result = subprocess.run(
         ["makemkvcon", "-r", "info", f"disc:{disc_num}"],
         capture_output=True, text=True, check=True,
@@ -196,10 +247,10 @@ def get_disc_titles(disc_num=0):
             title["chapter_count"] = int(value) if value.isdigit() else None
         elif attr_id == 16:  # Source filename (e.g. VTS_04_1.VOB or 00003.mpls)
             title["source_filename"] = value
-    return titles
+    return titles, get_makemkv_error_messages(result.stdout)
 
 
-def choose_main_title(titles, device):
+def choose_main_title(titles, disc_errors, device):
     """Picks the disc title index to rip as the movie. Auto-picks the longest
     title over the min-length threshold when there's a single clear winner.
     If nothing clears the threshold, or two+ titles tie for longest (runtime
@@ -213,7 +264,7 @@ def choose_main_title(titles, device):
     }
     if not candidates:
         notify("MakeMKV didn't find any titles over the minimum length on "
-               "this disc - aborting.", device=device)
+               f"this disc - aborting.{format_makemkv_errors(disc_errors)}", device=device)
         return None
 
     by_duration = sorted(candidates.items(), key=lambda kv: kv[1]["duration_seconds"], reverse=True)
@@ -644,10 +695,17 @@ def main():
                     continue
 
             raw_dir = os.path.join(cfg.RAW_RIP_DIR, str(int(time.time())))
-            titles = get_disc_titles()
+            try:
+                titles, disc_errors = get_disc_titles()
+            except subprocess.CalledProcessError as e:
+                notify(f"MakeMKV failed to read the disc (exit code {e.returncode}) - "
+                       "aborting. Check the terminal for details.", device=device)
+                print(f"Command failed: {e}", file=sys.stderr)
+                continue
+
             try:
                 if content_type == "Movie":
-                    title_index = choose_main_title(titles, device)
+                    title_index = choose_main_title(titles, disc_errors, device)
                     if title_index is None:
                         continue
                     rip_title(raw_dir, title_index)
@@ -659,7 +717,7 @@ def main():
                     )
                     if not episode_indices:
                         notify("No titles on this disc matched the expected episode "
-                               "length - aborting.", device=device)
+                               f"length - aborting.{format_makemkv_errors(disc_errors)}", device=device)
                         continue
                     rip_titles(raw_dir, episode_indices)
             except subprocess.CalledProcessError as e:
