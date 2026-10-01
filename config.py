@@ -18,15 +18,23 @@ ENCODED_DIR = WORK_DIR + "/encoded"      # FFmpeg output lands here
 
 # --- MakeMKV settings ---
 # Movie-only: filters out trailers/junk titles when picking the main feature.
-# TV rips instead ask for an expected episode length per disc and use that
-# as a range (see EPISODE_LENGTH_PAD_MINUTES below), since a single minimum
-# can't tell a short episode apart from a "Play All" compilation title.
+# TV rips instead detect (or, failing that, ask for) the episode length per
+# disc and use that as a range (see EPISODE_LENGTH_PAD_MINUTES below), since
+# a single minimum can't tell a short episode apart from a "Play All" compilation title.
 MAKEMKV_MIN_LENGTH_SECONDS = 3900        # 65 min
 
-# Default +/- padding (in minutes) around the episode length you enter for
-# a TV rip, used to decide which disc titles are ripped as episodes. You're
-# asked at rip time whether to use this default or a custom padding instead.
+# Default +/- padding (in minutes) around the episode length for a TV rip,
+# used to decide which disc titles are ripped as episodes. The episode
+# length is auto-detected from the disc (the largest group of titles whose
+# durations all fit within this padding of a common center); you're only
+# asked for a length, or to adjust the padding, if detection fails.
 EPISODE_LENGTH_PAD_MINUTES = 2
+
+# Episode-length auto-detection: titles shorter than this are ignored
+# (menus, logos, short clips), and at least this many titles must share a
+# length before it's trusted as the episode length.
+EPISODE_DETECT_MIN_SECONDS = 300         # 5 min
+EPISODE_DETECT_MIN_TITLES = 2
 
 # --- FFmpeg / NVENC encode settings ---
 # RTX 3080 Max-Q supports NVENC hardware encoding.

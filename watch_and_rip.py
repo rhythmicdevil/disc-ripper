@@ -115,9 +115,10 @@ def wait_for_disc():
 def rip_titles(raw_out_dir, title_indices):
     """Rips a specific set of already-chosen disc titles, one at a time.
     Used for TV, where candidate titles are picked in Python beforehand by
-    matching duration against a user-supplied episode-length range (see
-    choose_episode_length_range) - so a "Play All" compilation title (much
-    longer than any single episode) never gets ripped in the first place,
+    matching duration against an episode-length range (detected from the
+    disc, or user-supplied as a fallback - see choose_episode_length_range) -
+    so a "Play All" compilation title (much longer than any single episode)
+    never gets ripped in the first place,
     instead of being ripped and then having to be filtered out by hand."""
     os.makedirs(raw_out_dir, exist_ok=True)
     progress = zenity_progress_pulse(
@@ -478,23 +479,53 @@ def prompt_required_int(prompt_text, field_label, device):
         return None
 
 
-def choose_episode_length_range(device):
+def detect_episode_range(titles, pad_seconds):
+    """Works out the episode-length range from the disc's own title list, on
+    the basis that every episode in a season runs roughly the same length.
+    Slides a window of 2 * pad_seconds over the sorted title durations and
+    keeps the window holding the most titles (ties go to the longer group,
+    since bonus featurettes tend to be shorter than episodes). A "Play All"
+    compilation is several episodes long, so it never lands in the same
+    window as the episodes themselves. Titles under
+    cfg.EPISODE_DETECT_MIN_SECONDS (menus, logos, short clips) are ignored.
+    Returns (min_seconds, max_seconds, title_count) centered on the group,
+    or None if no length is shared by at least cfg.EPISODE_DETECT_MIN_TITLES
+    titles."""
+    durations = sorted(
+        info["duration_seconds"] for info in titles.values()
+        if info.get("duration_seconds", 0) >= cfg.EPISODE_DETECT_MIN_SECONDS
+    )
+    best = None  # (count, total_seconds, low, high)
+    hi_idx = 0
+    for lo_idx, low in enumerate(durations):
+        hi_idx = max(hi_idx, lo_idx)
+        while hi_idx + 1 < len(durations) and durations[hi_idx + 1] - low <= 2 * pad_seconds:
+            hi_idx += 1
+        group = durations[lo_idx:hi_idx + 1]
+        candidate = (len(group), sum(group), low, durations[hi_idx])
+        if best is None or candidate[:2] > best[:2]:
+            best = candidate
+
+    if best is None or best[0] < cfg.EPISODE_DETECT_MIN_TITLES:
+        return None
+    count, _total, low, high = best
+    center = (low + high) / 2
+    return max(0, center - pad_seconds), center + pad_seconds, count
+
+
+def ask_episode_length_range(device, default_pad):
     """Asks for the approximate episode length and turns it into a
-    (min_seconds, max_seconds) window used to pick which disc titles get
-    ripped as episodes - the input length is the center of the range, and a
-    padding (default cfg.EPISODE_LENGTH_PAD_MINUTES, overridable here) sets
-    how wide it is on each side. Using a range instead of a bare minimum
-    means a "Play All" compilation title (much longer than any one episode)
-    is naturally excluded, instead of being the only title that clears a
-    minimum-length filter tuned for movies. Returns None if the user
-    cancels any prompt (the disc has already been ejected by then)."""
+    (min_seconds, max_seconds) window - the input length is the center of
+    the range, and a padding (default_pad, overridable here) sets how wide
+    it is on each side. Fallback for when detect_episode_range can't work
+    the length out from the disc. Returns None if the user cancels any
+    prompt (the disc has already been ejected by then)."""
     length_min = prompt_required_int(
         "Approximate episode length in minutes (e.g. 23):", "episode length", device
     )
     if length_min is None:
         return None
 
-    default_pad = cfg.EPISODE_LENGTH_PAD_MINUTES
     choice = zenity_choice(
         f"Match episodes within {default_pad} minutes of that length "
         f"({length_min - default_pad}-{length_min + default_pad} min), "
@@ -502,6 +533,7 @@ def choose_episode_length_range(device):
         [f"Use default (±{default_pad} min)", "Set custom padding"],
     )
     if not choice:
+        eject_disc(device)
         return None
 
     pad_min = default_pad
@@ -513,6 +545,52 @@ def choose_episode_length_range(device):
     min_seconds = max(0, (length_min - pad_min) * 60)
     max_seconds = (length_min + pad_min) * 60
     return min_seconds, max_seconds
+
+
+def choose_episode_length_range(titles, device):
+    """Returns the (min_seconds, max_seconds) window used to pick which disc
+    titles get ripped as episodes. Using a range instead of a bare minimum
+    means a "Play All" compilation title (much longer than any one episode)
+    is naturally excluded, instead of being the only title that clears a
+    minimum-length filter tuned for movies.
+
+    The length is auto-detected from the disc (see detect_episode_range)
+    using cfg.EPISODE_LENGTH_PAD_MINUTES as the padding. Only if that fails
+    is the user asked - either to enter the length by hand, or to adjust the
+    padding and retry detection. Returns None if the user cancels (the disc
+    has already been ejected by then)."""
+    pad_min = cfg.EPISODE_LENGTH_PAD_MINUTES
+    while True:
+        detected = detect_episode_range(titles, pad_min * 60)
+        if detected:
+            min_seconds, max_seconds, count = detected
+            print(f"Detected episode length: {min_seconds / 60:.0f}-{max_seconds / 60:.0f} min "
+                  f"({count} matching title(s), ±{pad_min} min padding)")
+            return min_seconds, max_seconds
+
+        lengths = ", ".join(
+            f"{info['duration_seconds'] / 60:.0f}"
+            for _idx, info in sorted(titles.items())
+            if info.get("duration_seconds", 0) >= 60
+        ) or "none"
+        choice = zenity_choice(
+            f"Couldn't work out the episode length from this disc "
+            f"(no {cfg.EPISODE_DETECT_MIN_TITLES}+ titles within ±{pad_min} min "
+            f"of each other).\n\nTitle lengths on disc (min): {lengths}",
+            ["Enter episode length", "Adjust padding and try again"],
+        )
+        if not choice:
+            eject_disc(device)
+            return None
+        if choice.startswith("Enter"):
+            return ask_episode_length_range(device, pad_min)
+
+        new_pad = prompt_required_int(
+            f"Padding in minutes (currently {pad_min}):", "padding", device
+        )
+        if new_pad is None:
+            return None
+        pad_min = max(0, new_pad)
 
 
 def handle_movie(raw_dir, title, year, device):
@@ -640,10 +718,6 @@ def main():
                 if season_num is None:
                     continue
 
-                episode_range = choose_episode_length_range(device)
-                if episode_range is None:
-                    continue
-
             raw_dir = os.path.join(cfg.RAW_RIP_DIR, str(int(time.time())))
             titles = get_disc_titles()
             try:
@@ -653,6 +727,11 @@ def main():
                         continue
                     rip_title(raw_dir, title_index)
                 else:
+                    # Needs the disc's title list, so this runs after
+                    # get_disc_titles rather than with the up-front prompts.
+                    episode_range = choose_episode_length_range(titles, device)
+                    if episode_range is None:
+                        continue
                     min_seconds, max_seconds = episode_range
                     episode_indices = sorted(
                         idx for idx, info in titles.items()

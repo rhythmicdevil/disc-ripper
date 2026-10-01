@@ -76,11 +76,16 @@ Leave the terminal open. Insert a disc:
   length (`MAKEMKV_MIN_LENGTH_SECONDS` in `config.py`, defaults to 65 min),
   and the script assumes the *longest* one is the movie itself (usually
   correct) and encodes just that one.
-- **TV Show**: enter the show name and season number, then the approximate
-  **episode length in minutes**. That length becomes the center of a range
-  (± `EPISODE_LENGTH_PAD_MINUTES` in `config.py`, default 2 min — you're
-  asked at rip time whether to use that default or a custom padding), and
-  only disc titles whose duration falls in that range get ripped as episode
+- **TV Show**: enter the show name and season number. The **episode
+  length is detected from the disc**: since every episode in a season runs
+  about the same length, the script finds the biggest group of titles whose
+  durations all fall within ± `EPISODE_LENGTH_PAD_MINUTES` (`config.py`,
+  default 2 min) of a common center, and uses that center ± the padding as
+  the range. Titles under `EPISODE_DETECT_MIN_SECONDS` (5 min) are ignored,
+  and at least `EPISODE_DETECT_MIN_TITLES` (2) titles have to match. Only if
+  no length can be found are you asked to either enter the episode length
+  by hand (and pick a padding) or adjust the padding and retry detection.
+  Only disc titles whose duration falls in that range get ripped as episode
   candidates. This is what keeps a "Play All" compilation title (much
   longer than any single episode) from being mistaken for an episode, or
   even ripped at all — the old fixed minimum-length filter was tuned for
@@ -127,12 +132,13 @@ Ctrl+C it.
   title that's longer than the actual movie (concatenates it with something
   else). If a movie comes out with a suspiciously long runtime, check the
   raw MakeMKV output folder before trusting the automation blindly.
-- **TV episode-length range**: if you enter a length that's off, or use too
-  narrow a padding, real episodes can fall outside the range and get
-  skipped entirely (nothing to select them from afterward, since they were
-  never ripped). If a disc comes up with fewer episodes than expected,
-  re-check the length/padding you entered before assuming something else
-  is wrong.
+- **TV episode-length range**: if the padding is too narrow (or a length
+  you entered by hand is off), real episodes can fall outside the range and
+  get skipped entirely (nothing to select them from afterward, since they
+  were never ripped). Detection can also lock onto the wrong group on a disc
+  with more bonus features than episodes; the detected range is printed in
+  the terminal. If a disc comes up with fewer episodes than expected, check
+  that line and the padding before assuming something else is wrong.
 - **TV numbering**: the episode-number prompt is now pre-filled with a
   guess (disc title order, cross-checked against source filename and
   chapter count) and tells you its confidence — but MakeMKV title order
