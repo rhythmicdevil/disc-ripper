@@ -274,8 +274,8 @@ def guess_episode_order(mkv_files, titles):
     Returns a list of (path, guessed_offset, confidence, reason) - one
     entry per file in mkv_files, ordered by the guess (files MakeMKV's
     naming couldn't be matched to a title go last, sorted by duration).
-    guessed_offset is 0-based (add 1 for an episode number assuming this
-    disc starts at episode 1); it's None when nothing could be guessed."""
+    guessed_offset is 0-based (add the disc's first episode number - see
+    highest_episode_on_server); it's None when nothing could be guessed."""
     matched = []
     unmatched = []
     for f in mkv_files:
@@ -405,6 +405,32 @@ def rsync_to_server(local_path, remote_dir):
         check=True,
     )
     subprocess.run(["rsync", "-avh", "--progress", str(local_path), remote_target], check=True)
+
+
+def highest_episode_on_server(remote_dir, season_num):
+    """Returns the highest episode number already in a season folder on the
+    media server (from "SxxEyy" in the filenames - for a multi-episode file
+    like "S01E03-E04" the last number counts), 0 if the folder is missing or
+    has no episodes, or None if the server couldn't be reached. Seasons span
+    several discs and each disc's titles are numbered from scratch, so this
+    is where the next disc's episode numbering picks up from."""
+    result = subprocess.run(
+        ["ssh", f"{cfg.SSH_USER}@{cfg.SSH_HOST}",
+         f"ls -1 {shlex.quote(remote_dir)} 2>/dev/null || true"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        print(f"Couldn't list {remote_dir} on the server: {result.stderr.strip()}",
+              file=sys.stderr)
+        return None
+
+    episode_re = re.compile(rf"S0*{season_num}E(\d+)(?:-?E(\d+))?", re.IGNORECASE)
+    highest = 0
+    for name in result.stdout.splitlines():
+        match = episode_re.search(name)
+        if match:
+            highest = max(highest, *(int(n) for n in match.groups() if n))
+    return highest
 
 
 def cleanup_encoded_file(encoded_path):
@@ -618,6 +644,19 @@ def handle_tv(raw_dir, show_name, season_num, device, titles):
         return
 
     guesses = guess_episode_order(mkv_files, titles)
+    season_folder = f"Season {season_num:02d}"
+    remote_season_dir = f"{cfg.REMOTE_TV_PATH}/{show_name}/{season_folder}"
+
+    # Earlier discs of this season may already be on the server - continue
+    # numbering after the highest episode there instead of restarting at 1.
+    highest = highest_episode_on_server(remote_season_dir, season_num)
+    first_episode = (highest or 0) + 1
+    if highest is None:
+        start_note = "couldn't reach the server to check for earlier discs, so starting at 1"
+    elif highest:
+        start_note = f"episodes up to {highest} are already on the server"
+    else:
+        start_note = "no episodes of this season on the server yet"
     # Looked up once per disc rather than per episode - it's the same show
     # for every file, no need to hit TMDB's search endpoint repeatedly.
     show_id = tmdb_find_show_id(show_name)
@@ -638,9 +677,10 @@ def handle_tv(raw_dir, show_name, season_num, device, titles):
         if not keep or keep.startswith("No"):
             continue
 
-        guessed_num = offset + 1 if offset is not None else None
+        guessed_num = offset + first_episode if offset is not None else None
         if guessed_num is not None:
-            hint = f"\n\nGuessed episode {guessed_num} ({confidence} confidence: {reason})."
+            hint = (f"\n\nGuessed episode {guessed_num} ({confidence} confidence: {reason}; "
+                    f"{start_note}).")
         else:
             hint = f"\n\nCouldn't guess a number ({reason})."
         episode = zenity_entry(
@@ -669,12 +709,11 @@ def handle_tv(raw_dir, show_name, season_num, device, titles):
         episode_title = tmdb_get_episode_title(show_id, season_num, episode_num)
         title_suffix = f" - {sanitize(episode_title)}" if episode_title else ""
 
-        season_folder = f"Season {season_num:02d}"
         episode_filename = f"{show_name} S{season_num:02d}E{episode_num:02d}{title_suffix}.mkv"
         encoded_path = Path(cfg.ENCODED_DIR) / show_name / season_folder / episode_filename
 
         label = f"{episode_filename} ({transferred + 1} of {total})"
-        if encode_and_send(f, encoded_path, f"{cfg.REMOTE_TV_PATH}/{show_name}/{season_folder}", label):
+        if encode_and_send(f, encoded_path, remote_season_dir, label):
             transferred += 1
 
     notify(f"Done! {transferred} of {total} episode(s) for {show_name} transferred to the media server.",

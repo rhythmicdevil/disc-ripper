@@ -100,6 +100,11 @@ Leave the terminal open. Insert a disc:
   whether to just confirm or double-check it. None of these signals are
   fully reliable on their own (discs get authored in all kinds of orders),
   so it's always a starting point you can edit, never assumed to be correct.
+  Since a season usually spans several discs, numbering continues from what's
+  already on the media server: the script lists the season folder over SSH
+  and starts this disc after the highest `SxxEyy` episode it finds (at 1 if
+  there are none yet, or if the server can't be reached — the prompt says
+  which).
   All of this happens up front, before any encoding starts, so you can walk
   away once you've answered for every ripped title.
   Once a number is confirmed, if the `TMDB_API_KEY` environment variable is
