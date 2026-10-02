@@ -91,23 +91,19 @@ Leave the terminal open. Insert a disc:
   even ripped at all — the old fixed minimum-length filter was tuned for
   movies and let compilations like that through as the *only* thing that
   cleared the threshold.
-  Then, for each ripped title you'll be asked if it's a real episode (so you
-  can still skip anything unexpected that landed in the range) and what
-  episode number it is. The episode number field is
-  pre-filled with a guess, derived from (in priority order) the disc's title
-  order, the disc source filename's sequence number, and the title's chapter
-  count — the prompt tells you the guess's confidence and why, so you know
-  whether to just confirm or double-check it. None of these signals are
-  fully reliable on their own (discs get authored in all kinds of orders),
-  so it's always a starting point you can edit, never assumed to be correct.
-  Since a season usually spans several discs, numbering continues from what's
+  Every ripped title matched the episode length, so it's treated as an
+  episode and **numbered automatically** — no per-title questions. The
+  number comes from the disc's title order, cross-checked against the disc
+  source filename's sequence number and the title's chapter count. Since a
+  season usually spans several discs, numbering continues from what's
   already on the media server: the script lists the season folder over SSH
   and starts this disc after the highest `SxxEyy` episode it finds (at 1 if
-  there are none yet, or if the server can't be reached — the prompt says
-  which).
-  All of this happens up front, before any encoding starts, so you can walk
-  away once you've answered for every ripped title.
-  Once a number is confirmed, if the `TMDB_API_KEY` environment variable is
+  there are none yet, or if the server can't be reached). Each assignment is
+  printed in the terminal. You're only asked for a number (pre-filled with
+  the guess; leave it blank to skip the file) for titles where those signals
+  disagree or no guess could be made. All of this happens up front, before
+  any encoding starts, and the final "Done" dialog lists every file sent.
+  Once a number is settled, if the `TMDB_API_KEY` environment variable is
   set, the script looks up that episode's title on TMDB and appends it to the
   filename (e.g. `Buffy the Vampire Slayer S01E01 - Welcome to the
   Hellmouth.mkv`). If the lookup fails or isn't configured, the file is just
@@ -144,15 +140,12 @@ Ctrl+C it.
   with more bonus features than episodes; the detected range is printed in
   the terminal. If a disc comes up with fewer episodes than expected, check
   that line and the padding before assuming something else is wrong.
-- **TV numbering**: the episode-number prompt is now pre-filled with a
-  guess (disc title order, cross-checked against source filename and
-  chapter count) and tells you its confidence — but MakeMKV title order
-  still doesn't *necessarily* match episode order, so treat "high
-  confidence" as "probably right," not "definitely right." Worth
-  double-checking against the actual episode list for anything with
-  bonus features, double-length episodes, or a disc that starts mid-season
-  (the guess always assumes disc 1 = episode 1), same as we discussed for
-  Legend of Korra.
+- **TV numbering**: episodes are numbered automatically when the guess is
+  high or medium confidence, but MakeMKV title order still doesn't
+  *necessarily* match episode order, so treat that as "probably right," not
+  "definitely right." Check the file list in the "Done" dialog against the
+  actual episode list, especially for discs with bonus features or
+  double-length episodes, same as we discussed for Legend of Korra.
 - **Naming conventions**: this matches what we set up for Jellyfin —
   `Title (Year)/Title (Year).mkv` for movies, `Show/Season NN/Show SxxExx.mkv`
   for TV.

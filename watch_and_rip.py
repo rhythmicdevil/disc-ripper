@@ -661,30 +661,29 @@ def handle_tv(raw_dir, show_name, season_num, device, titles):
     # for every file, no need to hit TMDB's search endpoint repeatedly.
     show_id = tmdb_find_show_id(show_name)
 
-    # Ask about every ripped title up front, so we know the total transfer
-    # count before encoding starts and can walk away for the whole batch.
-    # The episode number field is pre-filled with a guess (from disc title
-    # order, cross-checked against source filename and chapter count - see
-    # guess_episode_order) so most discs just need a confirming click
-    # instead of typing every number by hand.
+    # Every ripped title already matched the disc's episode length, so it's
+    # treated as an episode and numbered automatically from the guess (disc
+    # title order, cross-checked against source filename and chapter count -
+    # see guess_episode_order). The user is only asked about titles whose
+    # guess is low confidence or missing. All of this happens before
+    # encoding starts, so the whole batch can run unattended.
     episodes = []
     for f, offset, confidence, reason in guesses:
-        duration_min = get_duration_seconds(f) / 60
-        keep = zenity_choice(
-            f"File: {f.name}\nDuration: {duration_min:.0f} min\n\nIs this an episode?",
-            ["Yes - it's an episode", "No - skip this file"]
-        )
-        if not keep or keep.startswith("No"):
+        guessed_num = offset + first_episode if offset is not None else None
+        if guessed_num is not None and confidence != "low":
+            print(f"{f.name} -> episode {guessed_num} ({confidence} confidence: {reason}; "
+                  f"{start_note})")
+            episodes.append((f, guessed_num))
             continue
 
-        guessed_num = offset + first_episode if offset is not None else None
+        duration_min = get_duration_seconds(f) / 60
         if guessed_num is not None:
-            hint = (f"\n\nGuessed episode {guessed_num} ({confidence} confidence: {reason}; "
-                    f"{start_note}).")
+            hint = f"Guessed episode {guessed_num} ({reason}; {start_note})."
         else:
-            hint = f"\n\nCouldn't guess a number ({reason})."
+            hint = f"Couldn't guess a number ({reason})."
         episode = zenity_entry(
-            f"Episode number for {f.name} (e.g. 1):{hint}",
+            f"File: {f.name}\nDuration: {duration_min:.0f} min\n\n{hint}\n\n"
+            "Episode number (leave blank to skip this file):",
             default_text=guessed_num,
         )
         if not episode:
@@ -702,7 +701,7 @@ def handle_tv(raw_dir, show_name, season_num, device, titles):
         notify(f"No episodes selected for {show_name} - nothing to transfer.", device=device)
         return
 
-    transferred = 0
+    transferred = []
     for f, episode_num in episodes:
         # Only look up the episode title once the number is confirmed -
         # there's no point querying TMDB for a number that might still change.
@@ -712,11 +711,14 @@ def handle_tv(raw_dir, show_name, season_num, device, titles):
         episode_filename = f"{show_name} S{season_num:02d}E{episode_num:02d}{title_suffix}.mkv"
         encoded_path = Path(cfg.ENCODED_DIR) / show_name / season_folder / episode_filename
 
-        label = f"{episode_filename} ({transferred + 1} of {total})"
+        label = f"{episode_filename} ({len(transferred) + 1} of {total})"
         if encode_and_send(f, encoded_path, remote_season_dir, label):
-            transferred += 1
+            transferred.append(episode_filename)
 
-    notify(f"Done! {transferred} of {total} episode(s) for {show_name} transferred to the media server.",
+    # Numbers were mostly assigned without asking, so list what was sent
+    # to make a wrong guess easy to spot.
+    notify(f"Done! {len(transferred)} of {total} episode(s) for {show_name} transferred "
+           "to the media server:\n\n" + "\n".join(transferred),
            device=device)
 
 
