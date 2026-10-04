@@ -115,10 +115,9 @@ def wait_for_disc():
 def rip_titles(raw_out_dir, title_indices):
     """Rips a specific set of already-chosen disc titles, one at a time.
     Used for TV, where candidate titles are picked in Python beforehand by
-    matching duration against an episode-length range (detected from the
-    disc, or user-supplied as a fallback - see choose_episode_length_range) -
-    so a "Play All" compilation title (much longer than any single episode)
-    never gets ripped in the first place,
+    matching lengths (or picked by the user as a fallback - see
+    choose_episode_titles) - so a "Play All" compilation title (much longer
+    than any single episode) never gets ripped in the first place,
     instead of being ripped and then having to be filtered out by hand."""
     os.makedirs(raw_out_dir, exist_ok=True)
     progress = zenity_progress_pulse(
@@ -163,17 +162,26 @@ def parse_makemkv_duration(value):
 
 def get_disc_titles(disc_num=0):
     """Queries MakeMKV's title list for the disc (name, duration, chapter
-    count, and source filename per title) without ripping anything - just
-    reads the disc structure, so it's fast. Title indices are returned in
-    MakeMKV's own order, which is normally the disc's authoring order.
+    count, source filename, segment map, and audio/subtitle track count per
+    title) without ripping anything - just reads the disc structure, so it's
+    fast. Title indices are returned in MakeMKV's own order, which isn't
+    always the disc's authoring order (see guess_episode_order).
     Returns {title_index: {"name": str, "duration_seconds": float,
-    "chapter_count": int|None, "source_filename": str|None}}."""
+    "chapter_count": int|None, "source_filename": str|None,
+    "segment_map": str|None, "track_count": int}}."""
     result = subprocess.run(
         ["makemkvcon", "-r", "info", f"disc:{disc_num}"],
         capture_output=True, text=True, check=True,
     )
     titles = {}
     for line in result.stdout.splitlines():
+        if line.startswith("SINFO:"):
+            # SINFO:<title_index>,<stream_index>,<attribute_id>,<code>,"<value>"
+            parts = line[len("SINFO:"):].split(",", 4)
+            if len(parts) == 5 and parts[2] == "1" and parts[4].strip('"') in ("Audio", "Subtitles"):
+                title = titles.setdefault(int(parts[0]), {})
+                title["track_count"] = title.get("track_count", 0) + 1
+            continue
         if not line.startswith("TINFO:"):
             continue
         # TINFO:<title_index>,<attribute_id>,<code>,"<value>" - split(maxsplit=3)
@@ -197,6 +205,8 @@ def get_disc_titles(disc_num=0):
             title["chapter_count"] = int(value) if value.isdigit() else None
         elif attr_id == 16:  # Source filename (e.g. VTS_04_1.VOB or 00003.mpls)
             title["source_filename"] = value
+        elif attr_id == 26:  # Segment map - the video clips/cells the title plays
+            title["segment_map"] = value
     return titles
 
 
@@ -262,14 +272,16 @@ def source_file_number(source_filename):
 
 
 def guess_episode_order(mkv_files, titles):
-    """Guesses each ripped file's position in episode order. Ordering
-    itself always comes from the disc's title order (the order MakeMKV
-    lists titles in, recovered here from MakeMKV's default '..._t<NN>.mkv'
-    output naming). The source filename's sequence number and the title's
-    chapter count are used only as cross-checks that downgrade confidence
-    when they disagree - discs get authored in all kinds of orders, so this
-    is a starting guess for the user to confirm or correct, never a final
-    answer.
+    """Guesses each ripped file's position in episode order. When every
+    title has a distinct source file number (Blu-ray playlist '00071.mpls',
+    or DVD titleset 'VTS_04_1.VOB'), files are ordered by that - authoring
+    tools number these sequentially, and MakeMKV's own title order can be
+    scrambled (e.g. on Blu-rays that list each episode under several
+    playlists). Otherwise the order falls back to MakeMKV's title order,
+    recovered from its default '..._t<NN>.mkv' output naming. A title whose
+    chapter count differs from the other episodes is flagged as low
+    confidence. Discs get authored in all kinds of orders, so this is a
+    best guess, never a final answer.
 
     Returns a list of (path, guessed_offset, confidence, reason) - one
     entry per file in mkv_files, ordered by the guess (files MakeMKV's
@@ -292,27 +304,21 @@ def guess_episode_order(mkv_files, titles):
             "chapter_count": info.get("chapter_count"),
         })
 
-    matched.sort(key=lambda c: c["title_index"])
-
     source_numbers = [c["source_number"] for c in matched]
-    source_order_known = all(n is not None for n in source_numbers)
-    source_order_agrees = source_order_known and source_numbers == sorted(source_numbers)
+    if None not in source_numbers and len(set(source_numbers)) == len(source_numbers):
+        matched.sort(key=lambda c: c["source_number"])
+        base_confidence, base_reason = "high", "disc file order"
+    else:
+        matched.sort(key=lambda c: c["title_index"])
+        base_confidence, base_reason = "medium", "disc title order"
 
     chapter_counts = [c["chapter_count"] for c in matched if c["chapter_count"]]
     mode_chapter_count = max(set(chapter_counts), key=chapter_counts.count) if chapter_counts else None
 
     results = []
     for offset, c in enumerate(matched):
-        reasons = ["disc title order"]
-        confidence = "high"
-
-        if not source_order_known:
-            confidence = "medium"
-        elif source_order_agrees:
-            reasons.append("agrees with disc file order")
-        else:
-            confidence = "low"
-            reasons.append("disagrees with disc file order")
+        reasons = [base_reason]
+        confidence = base_confidence
 
         if mode_chapter_count is not None and c["chapter_count"] not in (None, mode_chapter_count):
             confidence = "low"
@@ -505,118 +511,122 @@ def prompt_required_int(prompt_text, field_label, device):
         return None
 
 
-def detect_episode_range(titles, pad_seconds):
-    """Works out the episode-length range from the disc's own title list, on
-    the basis that every episode in a season runs roughly the same length.
-    Slides a window of 2 * pad_seconds over the sorted title durations and
-    keeps the window holding the most titles (ties go to the longer group,
-    since bonus featurettes tend to be shorter than episodes). A "Play All"
-    compilation is several episodes long, so it never lands in the same
-    window as the episodes themselves. Titles under
-    cfg.EPISODE_DETECT_MIN_SECONDS (menus, logos, short clips) are ignored.
-    Returns (min_seconds, max_seconds, title_count) centered on the group,
-    or None if no length is shared by at least cfg.EPISODE_DETECT_MIN_TITLES
-    titles."""
-    durations = sorted(
-        info["duration_seconds"] for info in titles.values()
+def drop_duplicate_titles(titles):
+    """Removes titles that play the same video as another title. Blu-rays
+    often list each episode under several playlists that differ only in
+    which audio/subtitle tracks they carry (e.g. a French and a Japanese
+    version of the same episode) - ripping them all would give every
+    episode twice. Titles are grouped by segment map (the clips they play),
+    and the one with the most audio + subtitle tracks is kept (ties go to
+    the lowest title index). Titles without a segment map are kept as-is.
+    Returns a new {title_index: info} dict."""
+    kept = {}
+    by_segments = {}
+    for idx, info in sorted(titles.items()):
+        segments = info.get("segment_map")
+        if not segments:
+            kept[idx] = info
+            continue
+        current = by_segments.get(segments)
+        if current is None or info.get("track_count", 0) > titles[current].get("track_count", 0):
+            by_segments[segments] = idx
+    for idx in by_segments.values():
+        kept[idx] = titles[idx]
+    dropped = sorted(set(titles) - set(kept))
+    if dropped:
+        print(f"Skipping duplicate title(s) {dropped} - same video as another title")
+    return dict(sorted(kept.items()))
+
+
+def detect_episode_titles(titles, pad_seconds):
+    """Picks the disc titles that are probably the episodes, on the basis
+    that every episode in a season runs about the same length: titles are
+    grouped by matching length (durations within 2 * pad_seconds of each
+    other), and the largest group wins. A "Play All" compilation is several
+    episodes long, so it never matches the episodes themselves. Titles
+    under cfg.EPISODE_DETECT_MIN_SECONDS (menus, logos, short clips) are
+    ignored.
+
+    Returns (best_indices, certain). best_indices is the largest group (on a
+    tie, the one with the longer titles, since bonus featurettes tend to be
+    shorter than episodes) or [] if there are no candidate titles at all.
+    certain is False when the group has fewer than
+    cfg.EPISODE_DETECT_MIN_TITLES titles or another, different group is just
+    as large - i.e. when length alone can't say which titles are episodes."""
+    candidates = sorted(
+        (info["duration_seconds"], idx) for idx, info in titles.items()
         if info.get("duration_seconds", 0) >= cfg.EPISODE_DETECT_MIN_SECONDS
     )
-    best = None  # (count, total_seconds, low, high)
-    hi_idx = 0
-    for lo_idx, low in enumerate(durations):
-        hi_idx = max(hi_idx, lo_idx)
-        while hi_idx + 1 < len(durations) and durations[hi_idx + 1] - low <= 2 * pad_seconds:
-            hi_idx += 1
-        group = durations[lo_idx:hi_idx + 1]
-        candidate = (len(group), sum(group), low, durations[hi_idx])
-        if best is None or candidate[:2] > best[:2]:
-            best = candidate
+    groups = []  # (count, total_seconds, indices)
+    for lo in range(len(candidates)):
+        hi = lo
+        while hi + 1 < len(candidates) and candidates[hi + 1][0] - candidates[lo][0] <= 2 * pad_seconds:
+            hi += 1
+        group = candidates[lo:hi + 1]
+        groups.append((len(group), sum(d for d, _ in group), sorted(i for _, i in group)))
+    if not groups:
+        return [], False
 
-    if best is None or best[0] < cfg.EPISODE_DETECT_MIN_TITLES:
-        return None
-    count, _total, low, high = best
-    center = (low + high) / 2
-    return max(0, center - pad_seconds), center + pad_seconds, count
+    groups.sort(key=lambda g: g[:2], reverse=True)
+    best_count, _total, best = groups[0]
+    tied = any(count == best_count and indices != best for count, _t, indices in groups[1:])
+    certain = best_count >= cfg.EPISODE_DETECT_MIN_TITLES and not tied
+    return best, certain
 
 
-def ask_episode_length_range(device, default_pad):
-    """Asks for the approximate episode length and turns it into a
-    (min_seconds, max_seconds) window - the input length is the center of
-    the range, and a padding (default_pad, overridable here) sets how wide
-    it is on each side. Fallback for when detect_episode_range can't work
-    the length out from the disc. Returns None if the user cancels any
-    prompt (the disc has already been ejected by then)."""
-    length_min = prompt_required_int(
-        "Approximate episode length in minutes (e.g. 23):", "episode length", device
+def ask_episode_titles(titles, suggested, device):
+    """Asks the user, in a single checklist, which disc titles are episodes.
+    Every title is listed with its length and chapter count, and the best
+    guess is pre-ticked. Returns the chosen title indices, or None if the
+    user cancels or ticks nothing (the disc has already been ejected by
+    then)."""
+    rows = []
+    for idx, info in sorted(titles.items()):
+        seconds = info.get("duration_seconds", 0)
+        rows += [
+            "TRUE" if idx in suggested else "FALSE",
+            str(idx),
+            f"{seconds // 3600}:{seconds // 60 % 60:02d}:{seconds % 60:02d}",
+            str(info.get("chapter_count") or ""),
+            info.get("name", ""),
+        ]
+    result = subprocess.run(
+        ["zenity", "--list", "--checklist", "--title", "Disc Ripper",
+         "--text", "Couldn't tell which titles are the episodes from their lengths.\n"
+                   "Tick the titles to rip as episodes:",
+         "--column", "Rip", "--column", "Title", "--column", "Length",
+         "--column", "Chapters", "--column", "Name",
+         "--print-column=2", "--separator= ", "--width=600", "--height=450",
+         *rows],
+        capture_output=True, text=True,
     )
-    if length_min is None:
+    chosen = sorted(int(i) for i in result.stdout.split()) if result.returncode == 0 else []
+    if not chosen:
+        notify("No titles selected - aborting.", device=device)
+        return None
+    return chosen
+
+
+def choose_episode_titles(titles, device):
+    """Returns the disc title indices to rip as episodes. They're picked
+    automatically by matching lengths (see detect_episode_titles, with
+    cfg.EPISODE_LENGTH_PAD_MINUTES as the tolerance); the user is asked -
+    once - only when that's not conclusive. Returns None if there's nothing
+    to rip (the disc has already been ejected by then)."""
+    if not titles:
+        notify("MakeMKV couldn't read any titles from this disc - aborting.", device=device)
         return None
 
-    choice = zenity_choice(
-        f"Match episodes within {default_pad} minutes of that length "
-        f"({length_min - default_pad}-{length_min + default_pad} min), "
-        "or set a custom padding?",
-        [f"Use default (±{default_pad} min)", "Set custom padding"],
-    )
-    if not choice:
-        eject_disc(device)
-        return None
+    titles = drop_duplicate_titles(titles)
+    best, certain = detect_episode_titles(titles, cfg.EPISODE_LENGTH_PAD_MINUTES * 60)
+    if certain:
+        lengths = ", ".join(f"{titles[i]['duration_seconds'] / 60:.0f}" for i in best)
+        print(f"Detected {len(best)} episode title(s): {best} (lengths in min: {lengths})")
+        return best
 
-    pad_min = default_pad
-    if choice.startswith("Set custom"):
-        pad_min = prompt_required_int("Padding in minutes (e.g. 2):", "padding", device)
-        if pad_min is None:
-            return None
-
-    min_seconds = max(0, (length_min - pad_min) * 60)
-    max_seconds = (length_min + pad_min) * 60
-    return min_seconds, max_seconds
-
-
-def choose_episode_length_range(titles, device):
-    """Returns the (min_seconds, max_seconds) window used to pick which disc
-    titles get ripped as episodes. Using a range instead of a bare minimum
-    means a "Play All" compilation title (much longer than any one episode)
-    is naturally excluded, instead of being the only title that clears a
-    minimum-length filter tuned for movies.
-
-    The length is auto-detected from the disc (see detect_episode_range)
-    using cfg.EPISODE_LENGTH_PAD_MINUTES as the padding. Only if that fails
-    is the user asked - either to enter the length by hand, or to adjust the
-    padding and retry detection. Returns None if the user cancels (the disc
-    has already been ejected by then)."""
-    pad_min = cfg.EPISODE_LENGTH_PAD_MINUTES
-    while True:
-        detected = detect_episode_range(titles, pad_min * 60)
-        if detected:
-            min_seconds, max_seconds, count = detected
-            print(f"Detected episode length: {min_seconds / 60:.0f}-{max_seconds / 60:.0f} min "
-                  f"({count} matching title(s), ±{pad_min} min padding)")
-            return min_seconds, max_seconds
-
-        lengths = ", ".join(
-            f"{info['duration_seconds'] / 60:.0f}"
-            for _idx, info in sorted(titles.items())
-            if info.get("duration_seconds", 0) >= 60
-        ) or "none"
-        choice = zenity_choice(
-            f"Couldn't work out the episode length from this disc "
-            f"(no {cfg.EPISODE_DETECT_MIN_TITLES}+ titles within ±{pad_min} min "
-            f"of each other).\n\nTitle lengths on disc (min): {lengths}",
-            ["Enter episode length", "Adjust padding and try again"],
-        )
-        if not choice:
-            eject_disc(device)
-            return None
-        if choice.startswith("Enter"):
-            return ask_episode_length_range(device, pad_min)
-
-        new_pad = prompt_required_int(
-            f"Padding in minutes (currently {pad_min}):", "padding", device
-        )
-        if new_pad is None:
-            return None
-        pad_min = max(0, new_pad)
+    # Don't eject before asking - the disc is still needed to rip the choice.
+    ring_bell()
+    return ask_episode_titles(titles, best, device)
 
 
 def handle_movie(raw_dir, title, year, device):
@@ -661,7 +671,7 @@ def handle_tv(raw_dir, show_name, season_num, device, titles):
     # for every file, no need to hit TMDB's search endpoint repeatedly.
     show_id = tmdb_find_show_id(show_name)
 
-    # Every ripped title already matched the disc's episode length, so it's
+    # Every ripped title was already picked as an episode, so it's
     # treated as an episode and numbered automatically from the guess (disc
     # title order, cross-checked against source filename and chapter count -
     # see guess_episode_order). The user is only asked about titles whose
@@ -770,17 +780,8 @@ def main():
                 else:
                     # Needs the disc's title list, so this runs after
                     # get_disc_titles rather than with the up-front prompts.
-                    episode_range = choose_episode_length_range(titles, device)
-                    if episode_range is None:
-                        continue
-                    min_seconds, max_seconds = episode_range
-                    episode_indices = sorted(
-                        idx for idx, info in titles.items()
-                        if min_seconds <= info.get("duration_seconds", 0) <= max_seconds
-                    )
-                    if not episode_indices:
-                        notify("No titles on this disc matched the expected episode "
-                               "length - aborting.", device=device)
+                    episode_indices = choose_episode_titles(titles, device)
+                    if episode_indices is None:
                         continue
                     rip_titles(raw_dir, episode_indices)
             except subprocess.CalledProcessError as e:

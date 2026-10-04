@@ -18,21 +18,19 @@ ENCODED_DIR = WORK_DIR + "/encoded"      # FFmpeg output lands here
 
 # --- MakeMKV settings ---
 # Movie-only: filters out trailers/junk titles when picking the main feature.
-# TV rips instead detect (or, failing that, ask for) the episode length per
-# disc and use that as a range (see EPISODE_LENGTH_PAD_MINUTES below), since
-# a single minimum can't tell a short episode apart from a "Play All" compilation title.
+# TV rips instead pick the titles with matching lengths (see
+# EPISODE_LENGTH_PAD_MINUTES below), since a single minimum can't tell a
+# short episode apart from a "Play All" compilation title.
 MAKEMKV_MIN_LENGTH_SECONDS = 3900        # 65 min
 
-# Default +/- padding (in minutes) around the episode length for a TV rip,
-# used to decide which disc titles are ripped as episodes. The episode
-# length is auto-detected from the disc (the largest group of titles whose
-# durations all fit within this padding of a common center); you're only
-# asked for a length, or to adjust the padding, if detection fails.
+# How close (+/- minutes) title lengths must be to count as "matching" for
+# a TV rip. The largest group of matching titles is ripped as the episodes;
+# if that's not conclusive you're asked once, with a checklist of titles.
 EPISODE_LENGTH_PAD_MINUTES = 2
 
-# Episode-length auto-detection: titles shorter than this are ignored
-# (menus, logos, short clips), and at least this many titles must share a
-# length before it's trusted as the episode length.
+# Episode detection: titles shorter than this are ignored (menus, logos,
+# short clips), and at least this many titles must match before they're
+# trusted as the episodes.
 EPISODE_DETECT_MIN_SECONDS = 300         # 5 min
 EPISODE_DETECT_MIN_TITLES = 2
 

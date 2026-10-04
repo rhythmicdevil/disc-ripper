@@ -76,33 +76,32 @@ Leave the terminal open. Insert a disc:
   length (`MAKEMKV_MIN_LENGTH_SECONDS` in `config.py`, defaults to 65 min),
   and the script assumes the *longest* one is the movie itself (usually
   correct) and encodes just that one.
-- **TV Show**: enter the show name and season number. The **episode
-  length is detected from the disc**: since every episode in a season runs
-  about the same length, the script finds the biggest group of titles whose
-  durations all fall within ± `EPISODE_LENGTH_PAD_MINUTES` (`config.py`,
-  default 2 min) of a common center, and uses that center ± the padding as
-  the range. Titles under `EPISODE_DETECT_MIN_SECONDS` (5 min) are ignored,
-  and at least `EPISODE_DETECT_MIN_TITLES` (2) titles have to match. Only if
-  no length can be found are you asked to either enter the episode length
-  by hand (and pick a padding) or adjust the padding and retry detection.
-  Only disc titles whose duration falls in that range get ripped as episode
-  candidates. This is what keeps a "Play All" compilation title (much
-  longer than any single episode) from being mistaken for an episode, or
-  even ripped at all — the old fixed minimum-length filter was tuned for
-  movies and let compilations like that through as the *only* thing that
-  cleared the threshold.
-  Every ripped title matched the episode length, so it's treated as an
-  episode and **numbered automatically** — no per-title questions. The
-  number comes from the disc's title order, cross-checked against the disc
-  source filename's sequence number and the title's chapter count. Since a
+- **TV Show**: enter the show name and season number. The script then
+  reads the disc's title list and **picks the episodes itself**:
+  - Titles that play the same video as another title are dropped. Blu-rays
+    often list each episode under several playlists that differ only in
+    audio/subtitle tracks; the one with the most tracks is kept.
+  - Since every episode in a season runs about the same length, the biggest
+    group of titles whose lengths match (within ± `EPISODE_LENGTH_PAD_MINUTES`
+    in `config.py`, default 2 min) is ripped as the episodes. Titles under
+    `EPISODE_DETECT_MIN_SECONDS` (5 min) are ignored. A "Play All"
+    compilation is several episodes long, so it never matches.
+  - If that's not conclusive (fewer than `EPISODE_DETECT_MIN_TITLES` titles
+    match, or two different groups are equally big), you're asked **once**:
+    a checklist of every title with its length and chapter count, with the
+    best guess pre-ticked.
+  The ripped episodes are then **numbered automatically**, ordered by the
+  disc's playlist/file numbers (`00071.mpls`, `VTS_04_1.VOB`) when each
+  title has a distinct one, otherwise by MakeMKV's title order. Since a
   season usually spans several discs, numbering continues from what's
   already on the media server: the script lists the season folder over SSH
   and starts this disc after the highest `SxxEyy` episode it finds (at 1 if
   there are none yet, or if the server can't be reached). Each assignment is
   printed in the terminal. You're only asked for a number (pre-filled with
-  the guess; leave it blank to skip the file) for titles where those signals
-  disagree or no guess could be made. All of this happens up front, before
-  any encoding starts, and the final "Done" dialog lists every file sent.
+  the guess; leave it blank to skip the file) for a title whose chapter
+  count doesn't match the other episodes, or that couldn't be matched back
+  to a disc title. All of this happens up front, before any encoding
+  starts, and the final "Done" dialog lists every file sent.
   Once a number is settled, if the `TMDB_API_KEY` environment variable is
   set, the script looks up that episode's title on TMDB and appends it to the
   filename (e.g. `Buffy the Vampire Slayer S01E01 - Welcome to the
@@ -133,15 +132,14 @@ Ctrl+C it.
   title that's longer than the actual movie (concatenates it with something
   else). If a movie comes out with a suspiciously long runtime, check the
   raw MakeMKV output folder before trusting the automation blindly.
-- **TV episode-length range**: if the padding is too narrow (or a length
-  you entered by hand is off), real episodes can fall outside the range and
-  get skipped entirely (nothing to select them from afterward, since they
-  were never ripped). Detection can also lock onto the wrong group on a disc
-  with more bonus features than episodes; the detected range is printed in
-  the terminal. If a disc comes up with fewer episodes than expected, check
-  that line and the padding before assuming something else is wrong.
+- **TV episode detection**: if the padding is too narrow, real episodes
+  can miss the matching group and never get ripped. Detection can also
+  pick the wrong group on a disc with more same-length bonus features than
+  episodes. The chosen titles (and any duplicates skipped) are printed in
+  the terminal - if a disc comes up with fewer episodes than expected,
+  check those lines and the padding first.
 - **TV numbering**: episodes are numbered automatically when the guess is
-  high or medium confidence, but MakeMKV title order still doesn't
+  high or medium confidence, but disc playlist or title order still doesn't
   *necessarily* match episode order, so treat that as "probably right," not
   "definitely right." Check the file list in the "Done" dialog against the
   actual episode list, especially for discs with bonus features or
