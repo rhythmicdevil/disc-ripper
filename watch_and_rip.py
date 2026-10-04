@@ -114,11 +114,10 @@ def wait_for_disc():
 
 def rip_titles(raw_out_dir, title_indices):
     """Rips a specific set of already-chosen disc titles, one at a time.
-    Used for TV, where candidate titles are picked in Python beforehand by
-    matching lengths (or picked by the user as a fallback - see
-    choose_episode_titles) - so a "Play All" compilation title (much longer
-    than any single episode) never gets ripped in the first place,
-    instead of being ripped and then having to be filtered out by hand."""
+    Titles are always picked from the disc's title list beforehand (see
+    choose_main_title and choose_episode_titles), so trailers, duplicate
+    playlists and "Play All" compilations never get ripped in the first
+    place, instead of being ripped and then filtered out by hand."""
     os.makedirs(raw_out_dir, exist_ok=True)
     progress = zenity_progress_pulse(
         f"Ripping {len(title_indices)} title(s) with MakeMKV — this can take a while..."
@@ -129,21 +128,6 @@ def rip_titles(raw_out_dir, title_indices):
                 ["makemkvcon", "mkv", "disc:0", str(title_index), raw_out_dir],
                 check=True,
             )
-    finally:
-        progress.terminate()
-
-
-def rip_title(raw_out_dir, title_index):
-    """Runs makemkvcon to rip a single, already-chosen title. Used for movies,
-    where we pick the main feature from the disc's title list before ripping
-    instead of ripping every long title and sorting afterward."""
-    os.makedirs(raw_out_dir, exist_ok=True)
-    progress = zenity_progress_pulse("Ripping disc with MakeMKV — this can take a while...")
-    try:
-        subprocess.run(
-            ["makemkvcon", "mkv", "disc:0", str(title_index), raw_out_dir],
-            check=True,
-        )
     finally:
         progress.terminate()
 
@@ -166,7 +150,7 @@ def get_disc_titles(disc_num=0):
     title) without ripping anything - just reads the disc structure, so it's
     fast. Title indices are returned in MakeMKV's own order, which isn't
     always the disc's authoring order (see guess_episode_order).
-    Returns {title_index: {"name": str, "duration_seconds": float,
+    Returns {title_index: {"name": str, "duration_seconds": int,
     "chapter_count": int|None, "source_filename": str|None,
     "segment_map": str|None, "track_count": int}}."""
     result = subprocess.run(
@@ -214,12 +198,14 @@ def choose_main_title(titles, device):
     """Picks the disc title index to rip as the movie. Auto-picks the longest
     title over the min-length threshold when there's a single clear winner.
     If nothing clears the threshold, or two+ titles tie for longest (runtime
-    alone can't disambiguate - e.g. a theatrical/extended pair, or duplicate
-    angle/audio encodes), notifies the user and lets them pick instead of
-    guessing wrong. Returns None if there's nothing to rip or the user didn't
-    choose - the disc has already been ejected by the time this returns None."""
+    alone can't disambiguate - e.g. a theatrical/extended pair), notifies
+    the user and lets them pick instead of guessing wrong. Playlists that
+    only differ in audio/subtitle tracks are dropped first (see
+    drop_duplicate_titles), so they don't count as a tie. Returns None if
+    there's nothing to rip or the user didn't choose - the disc has already
+    been ejected by the time this returns None."""
     candidates = {
-        idx: info for idx, info in titles.items()
+        idx: info for idx, info in drop_duplicate_titles(titles).items()
         if info.get("duration_seconds", 0) >= cfg.MAKEMKV_MIN_LENGTH_SECONDS
     }
     if not candidates:
@@ -671,12 +657,11 @@ def handle_tv(raw_dir, show_name, season_num, device, titles):
     # for every file, no need to hit TMDB's search endpoint repeatedly.
     show_id = tmdb_find_show_id(show_name)
 
-    # Every ripped title was already picked as an episode, so it's
-    # treated as an episode and numbered automatically from the guess (disc
-    # title order, cross-checked against source filename and chapter count -
-    # see guess_episode_order). The user is only asked about titles whose
-    # guess is low confidence or missing. All of this happens before
-    # encoding starts, so the whole batch can run unattended.
+    # Every ripped title was already picked as an episode, so it's numbered
+    # automatically from the guessed order (see guess_episode_order). The
+    # user is only asked about titles whose guess is low confidence or
+    # missing. All of this happens before encoding starts, so the whole
+    # batch can run unattended.
     episodes = []
     for f, offset, confidence, reason in guesses:
         guessed_num = offset + first_episode if offset is not None else None
@@ -770,13 +755,13 @@ def main():
                     continue
 
             raw_dir = os.path.join(cfg.RAW_RIP_DIR, str(int(time.time())))
-            titles = get_disc_titles()
             try:
+                titles = get_disc_titles()
                 if content_type == "Movie":
                     title_index = choose_main_title(titles, device)
                     if title_index is None:
                         continue
-                    rip_title(raw_dir, title_index)
+                    rip_titles(raw_dir, [title_index])
                 else:
                     # Needs the disc's title list, so this runs after
                     # get_disc_titles rather than with the up-front prompts.
