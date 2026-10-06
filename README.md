@@ -73,7 +73,8 @@ python3 watch_and_rip.py
 Leave the terminal open. Insert a disc:
 - A popup asks if it's a **Movie** or **TV Show**
 - **Movie**: enter title + year. The script reads the disc's title list,
-  drops playlists that only differ in audio/subtitle tracks, and rips just
+  drops playlists that only differ in audio/subtitle tracks (same video
+  and same size), and rips just
   the *longest* title over the minimum length (`MAKEMKV_MIN_LENGTH_SECONDS`
   in `config.py`, defaults to 65 min) - usually the movie itself. If two
   different titles tie for longest, you're asked to pick.
@@ -81,7 +82,9 @@ Leave the terminal open. Insert a disc:
   reads the disc's title list and **picks the episodes itself**:
   - Titles that play the same video as another title are dropped. Blu-rays
     often list each episode under several playlists that differ only in
-    audio/subtitle tracks; the one with the most tracks is kept.
+    audio/subtitle tracks; the one with the most tracks is kept. Titles only
+    count as the same video when both the segments they play and their size
+    match (on DVDs, different episodes often share segment numbers).
   - Since every episode in a season runs about the same length, the biggest
     group of titles whose lengths match (within ± `EPISODE_LENGTH_PAD_MINUTES`
     in `config.py`, default 2 min) is ripped as the episodes. Titles under

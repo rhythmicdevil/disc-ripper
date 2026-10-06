@@ -146,13 +146,13 @@ def parse_makemkv_duration(value):
 
 def get_disc_titles(disc_num=0):
     """Queries MakeMKV's title list for the disc (name, duration, chapter
-    count, source filename, segment map, and audio/subtitle track count per
-    title) without ripping anything - just reads the disc structure, so it's
+    count, source filename, segment map, size, and audio/subtitle track
+    count per title) without ripping anything - just reads the disc structure, so it's
     fast. Title indices are returned in MakeMKV's own order, which isn't
     always the disc's authoring order (see guess_episode_order).
     Returns {title_index: {"name": str, "duration_seconds": int,
     "chapter_count": int|None, "source_filename": str|None,
-    "segment_map": str|None, "track_count": int}}."""
+    "segment_map": str|None, "size_bytes": int|None, "track_count": int}}."""
     result = subprocess.run(
         ["makemkvcon", "-r", "info", f"disc:{disc_num}"],
         capture_output=True, text=True, check=True,
@@ -189,6 +189,8 @@ def get_disc_titles(disc_num=0):
             title["chapter_count"] = int(value) if value.isdigit() else None
         elif attr_id == 16:  # Source filename (e.g. VTS_04_1.VOB or 00003.mpls)
             title["source_filename"] = value
+        elif attr_id == 11:  # Size in bytes
+            title["size_bytes"] = int(value) if value.isdigit() else None
         elif attr_id == 26:  # Segment map - the video clips/cells the title plays
             title["segment_map"] = value
     return titles
@@ -502,21 +504,24 @@ def drop_duplicate_titles(titles):
     often list each episode under several playlists that differ only in
     which audio/subtitle tracks they carry (e.g. a French and a Japanese
     version of the same episode) - ripping them all would give every
-    episode twice. Titles are grouped by segment map (the clips they play),
-    and the one with the most audio + subtitle tracks is kept (ties go to
-    the lowest title index). Titles without a segment map are kept as-is.
+    episode twice. Titles count as the same video when both their segment
+    map (the clips/cells they play) and their size match: on a DVD the
+    segment map is cell numbers relative to each title (every episode can
+    be "1-6"), so it isn't unique on its own. Of each set of duplicates, the
+    one with the most audio + subtitle tracks is kept (ties go to the lowest
+    title index). Titles missing either value are kept as-is.
     Returns a new {title_index: info} dict."""
     kept = {}
-    by_segments = {}
+    by_video = {}
     for idx, info in sorted(titles.items()):
-        segments = info.get("segment_map")
-        if not segments:
+        video = (info.get("segment_map"), info.get("size_bytes"))
+        if None in video:
             kept[idx] = info
             continue
-        current = by_segments.get(segments)
+        current = by_video.get(video)
         if current is None or info.get("track_count", 0) > titles[current].get("track_count", 0):
-            by_segments[segments] = idx
-    for idx in by_segments.values():
+            by_video[video] = idx
+    for idx in by_video.values():
         kept[idx] = titles[idx]
     dropped = sorted(set(titles) - set(kept))
     if dropped:
@@ -562,8 +567,8 @@ def detect_episode_titles(titles, pad_seconds):
 
 def ask_episode_titles(titles, suggested, device):
     """Asks the user, in a single checklist, which disc titles are episodes.
-    Every title is listed with its length and chapter count, and the best
-    guess is pre-ticked. Returns the chosen title indices, or None if the
+    Every title is listed with its length and chapter count, and the
+    suggested titles are pre-ticked. Returns the chosen title indices, or None if the
     user cancels or ticks nothing (the disc has already been ejected by
     then)."""
     rows = []
@@ -611,8 +616,11 @@ def choose_episode_titles(titles, device):
         return best
 
     # Don't eject before asking - the disc is still needed to rip the choice.
+    # A "group" too small to count as matching isn't worth pre-ticking - on
+    # a disc where nothing matched it's usually just the Play All title.
     ring_bell()
-    return ask_episode_titles(titles, best, device)
+    suggested = best if len(best) >= cfg.EPISODE_DETECT_MIN_TITLES else []
+    return ask_episode_titles(titles, suggested, device)
 
 
 def handle_movie(raw_dir, title, year, device):
