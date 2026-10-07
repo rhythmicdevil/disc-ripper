@@ -91,7 +91,9 @@ Leave the terminal open. Insert a disc:
     `EPISODE_DETECT_MIN_SECONDS` (5 min) are ignored. A "Play All"
     compilation is several episodes long, so it never matches.
   - If that's not conclusive (fewer than `EPISODE_DETECT_MIN_TITLES` titles
-    match, or two different groups are equally big), you're asked **once**:
+    match, or two different groups are equally big), the disc is scanned
+    again after 10 seconds (a disc that's still spinning up can return only
+    some of its titles). If it's still not conclusive, you're asked **once**:
     a checklist of every title with its length and chapter count, with the
     best guess pre-ticked.
   The ripped episodes are then **numbered automatically**, ordered by the
@@ -136,6 +138,9 @@ Ctrl+C it.
   title that's longer than the actual movie (concatenates it with something
   else). If a movie comes out with a suspiciously long runtime, check the
   raw MakeMKV output folder before trusting the automation blindly.
+- **Disc scan logs**: MakeMKV's raw title scan for the last disc is saved to
+  `last_disc_scan.txt` (and `last_disc_rescan.txt` if it rescanned) in
+  `WORK_DIR`. If the ripper picks the wrong titles, check there first.
 - **TV episode detection**: if the padding is too narrow, real episodes
   can miss the matching group and never get ripped. Detection can also
   pick the wrong group on a disc with more same-length bonus features than

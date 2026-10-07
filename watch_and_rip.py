@@ -144,7 +144,7 @@ def parse_makemkv_duration(value):
     return seconds
 
 
-def get_disc_titles(disc_num=0):
+def get_disc_titles(disc_num=0, log_name="last_disc_scan.txt"):
     """Queries MakeMKV's title list for the disc (name, duration, chapter
     count, source filename, segment map, size, and audio/subtitle track
     count per title) without ripping anything - just reads the disc structure, so it's
@@ -152,11 +152,14 @@ def get_disc_titles(disc_num=0):
     always the disc's authoring order (see guess_episode_order).
     Returns {title_index: {"name": str, "duration_seconds": int,
     "chapter_count": int|None, "source_filename": str|None,
-    "segment_map": str|None, "size_bytes": int|None, "track_count": int}}."""
+    "segment_map": str|None, "size_bytes": int|None, "track_count": int}}.
+    MakeMKV's raw output is saved to log_name in cfg.WORK_DIR, so a disc
+    that gets misread can be diagnosed afterwards."""
     result = subprocess.run(
         ["makemkvcon", "-r", "info", f"disc:{disc_num}"],
         capture_output=True, text=True, check=True,
     )
+    Path(cfg.WORK_DIR, log_name).write_text(result.stdout)
     titles = {}
     for line in result.stdout.splitlines():
         if line.startswith("SINFO:"):
@@ -529,6 +532,11 @@ def drop_duplicate_titles(titles):
     return dict(sorted(kept.items()))
 
 
+# How long to wait before rescanning a disc whose first scan didn't settle
+# which titles are the episodes (see choose_episode_titles).
+RESCAN_DELAY_SECONDS = 10
+
+
 def detect_episode_titles(titles, pad_seconds):
     """Picks the disc titles that are probably the episodes, on the basis
     that every episode in a season runs about the same length: titles are
@@ -599,28 +607,43 @@ def ask_episode_titles(titles, suggested, device):
 
 
 def choose_episode_titles(titles, device):
-    """Returns the disc title indices to rip as episodes. They're picked
+    """Picks the disc title indices to rip as episodes. They're picked
     automatically by matching lengths (see detect_episode_titles, with
-    cfg.EPISODE_LENGTH_PAD_MINUTES as the tolerance); the user is asked -
-    once - only when that's not conclusive. Returns None if there's nothing
-    to rip (the disc has already been ejected by then)."""
+    cfg.EPISODE_LENGTH_PAD_MINUTES as the tolerance). If that's not
+    conclusive, the disc is scanned once more first - a scan that runs while
+    the disc is still spinning up can come back with only some of its
+    titles - and the user is asked, once, only if the rescan doesn't settle
+    it either. Returns (title_indices, titles), where titles is the scan
+    actually used, or None if there's nothing to rip (the disc has already
+    been ejected by then)."""
+    best, certain = detect_episode_titles(drop_duplicate_titles(titles),
+                                          cfg.EPISODE_LENGTH_PAD_MINUTES * 60)
+    if not certain:
+        print(f"Couldn't pick the episodes from {len(titles)} title(s) - "
+              f"rescanning the disc in {RESCAN_DELAY_SECONDS}s in case it wasn't fully read")
+        time.sleep(RESCAN_DELAY_SECONDS)
+        rescanned = get_disc_titles(log_name="last_disc_rescan.txt")
+        if len(rescanned) > len(titles):
+            print(f"Rescan found {len(rescanned)} title(s) - using it")
+            titles = rescanned
+            best, certain = detect_episode_titles(drop_duplicate_titles(titles),
+                                                  cfg.EPISODE_LENGTH_PAD_MINUTES * 60)
+
     if not titles:
         notify("MakeMKV couldn't read any titles from this disc - aborting.", device=device)
         return None
-
-    titles = drop_duplicate_titles(titles)
-    best, certain = detect_episode_titles(titles, cfg.EPISODE_LENGTH_PAD_MINUTES * 60)
     if certain:
         lengths = ", ".join(f"{titles[i]['duration_seconds'] / 60:.0f}" for i in best)
         print(f"Detected {len(best)} episode title(s): {best} (lengths in min: {lengths})")
-        return best
+        return best, titles
 
     # Don't eject before asking - the disc is still needed to rip the choice.
     # A "group" too small to count as matching isn't worth pre-ticking - on
     # a disc where nothing matched it's usually just the Play All title.
     ring_bell()
     suggested = best if len(best) >= cfg.EPISODE_DETECT_MIN_TITLES else []
-    return ask_episode_titles(titles, suggested, device)
+    chosen = ask_episode_titles(drop_duplicate_titles(titles), suggested, device)
+    return (chosen, titles) if chosen else None
 
 
 def handle_movie(raw_dir, title, year, device):
@@ -773,9 +796,10 @@ def main():
                 else:
                     # Needs the disc's title list, so this runs after
                     # get_disc_titles rather than with the up-front prompts.
-                    episode_indices = choose_episode_titles(titles, device)
-                    if episode_indices is None:
+                    chosen = choose_episode_titles(titles, device)
+                    if chosen is None:
                         continue
+                    episode_indices, titles = chosen
                     rip_titles(raw_dir, episode_indices)
             except subprocess.CalledProcessError as e:
                 notify(f"MakeMKV failed (exit code {e.returncode}) - aborting this disc. "
