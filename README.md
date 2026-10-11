@@ -90,10 +90,20 @@ Leave the terminal open. Insert a disc:
     in `config.py`, default 2 min) is ripped as the episodes. Titles under
     `EPISODE_DETECT_MIN_SECONDS` (5 min) are ignored. A "Play All"
     compilation is several episodes long, so it never matches.
-  - If that's not conclusive (fewer than `EPISODE_DETECT_MIN_TITLES` titles
-    match, or two different groups are equally big), the disc is scanned
-    again after 10 seconds (a disc that's still spinning up can return only
-    some of its titles). If it's still not conclusive, you're asked **once**:
+  - Some Blu-rays only offer the episodes back to back as one "Play All"
+    title: each episode is its own video clip on the disc but has no title
+    of its own, so MakeMKV never lists it. If the lengths don't settle
+    which titles are episodes, the script reads the disc's playlists
+    (mounting it read-only if needed). If a title plays several clips that
+    match each other in length, it rips that title once and cuts it into
+    one file per episode where the clips join, copying rather than
+    re-encoding. That takes about twice the title's size in `WORK_DIR`
+    for a moment. The episodes are numbered in play order.
+  - If that's not conclusive either (fewer than `EPISODE_DETECT_MIN_TITLES` titles
+    match, or two different groups are equally big), the disc is rescanned
+    up to 3 times, 30 seconds apart. Read errors on a scratched disc can make
+    MakeMKV drop titles, or the drive reset mid-scan, but a later scan often
+    reads it fine. If none settles it, you're asked **once**:
     a checklist of every title with its length and chapter count, with the
     best guess pre-ticked.
   The ripped episodes are then **numbered automatically**, ordered by the
@@ -125,6 +135,27 @@ Leave the terminal open. Insert a disc:
 Insert the next disc and repeat — the script loops forever until you
 Ctrl+C it.
 
+**Close MakeMKV's own app while the watcher runs.** It scans every disc as
+soon as it's inserted, and two programs reading an encrypted DVD at once
+make each other's reads fail. The watcher asks you to close it if it's open.
+
+### Discs the watcher can't read: `--from-folder`
+
+For a disc the watcher keeps misreading, rip it with MakeMKV's app instead
+(it shows read errors and lets you retry single titles), then hand the
+folder to the script:
+
+```bash
+uv run watch_and_rip.py --from-folder ~/Videos/ARCHER_S6_D2
+```
+
+It asks for the show name and season, then does everything the watcher
+does after ripping: picks the episodes by matching length (so a Play All or
+extras ripped along with them are skipped, with the same one-time checklist
+if it can't tell), numbers them on from what's already on the server, names
+them from TMDB, encodes, and sends. Episode order comes from the `_t01`,
+`_t02`… in MakeMKV's file names. The folder itself isn't changed or deleted.
+
 ## Notes / things to double check
 
 - **No sound on completion?**: the "done" chime is the plain terminal bell
@@ -139,8 +170,9 @@ Ctrl+C it.
   else). If a movie comes out with a suspiciously long runtime, check the
   raw MakeMKV output folder before trusting the automation blindly.
 - **Disc scan logs**: MakeMKV's raw title scan for the last disc is saved to
-  `last_disc_scan.txt` (and `last_disc_rescan.txt` if it rescanned) in
-  `WORK_DIR`. If the ripper picks the wrong titles, check there first.
+  `last_disc_scan.txt` (and `last_disc_rescan_1.txt` etc. if it rescanned)
+  in `WORK_DIR`. Errors MakeMKV reports also show up in the abort dialogs
+  and the episode checklist. If the ripper picks the wrong titles, check there first.
 - **TV episode detection**: if the padding is too narrow, real episodes
   can miss the matching group and never get ripped. Detection can also
   pick the wrong group on a disc with more same-length bonus features than

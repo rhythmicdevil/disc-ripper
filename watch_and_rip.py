@@ -17,13 +17,16 @@ Requires: makemkv-bin (or makemkv), ffmpeg, ffprobe, zenity, rsync, pyudev
   (MakeMKV: see https://www.makemkv.com/forum2/viewtopic.php?f=3&t=224)
 """
 
+import argparse
 import os
 import re
 import shlex
 import subprocess
 import sys
 import shutil
+import struct
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import pyudev
@@ -144,17 +147,18 @@ def parse_makemkv_duration(value):
     return seconds
 
 
-def get_makemkv_error_messages(stdout, min_code=5000):
-    """Extracts MakeMKV's own error-level messages (robot-mode 'MSG:' lines)
-    from raw makemkvcon output. By MakeMKV's own convention, codes below
-    5000 are informational disc-scan chatter ("Title #4 was added ...",
-    "Using direct disc access mode"), while 5000+ covers real failures
-    ("Failed to decode audio/video data for title #1 ...", "Failed to open
-    disc"). This matters because makemkvcon exits 0 even when it fails to
-    open a disc entirely (one bad title can abort the whole scan and wipe
-    out every title it already found) - so a caller with an empty title
-    list has no way to tell "nothing on this disc" from "MakeMKV choked"
-    without reading these."""
+def get_makemkv_error_messages(stdout):
+    """Extracts MakeMKV's own error messages (robot-mode 'MSG:' lines) from
+    raw makemkvcon output. Message codes don't separate errors from
+    information (5011 is "Operation successfully completed", 5050 the
+    evaluation-version notice, while SCSI read errors are 2003/2004), so
+    errors are picked out by their text: MakeMKV starts them with "Error",
+    "Failed" or "Can't" ("Error 'Scsi error - ...' occurred while reading
+    ...", "Failed to open disc", "Can't locate a cell for VTS 3 ..."). This
+    matters because makemkvcon exits 0 even when it fails to open a disc
+    entirely, or when read errors make it drop titles it already found - so
+    a caller with a short title list has no way to tell "that's all that's
+    on this disc" from "MakeMKV choked" without reading these."""
     messages = []
     for line in stdout.splitlines():
         if not line.startswith("MSG:"):
@@ -165,29 +169,53 @@ def get_makemkv_error_messages(stdout, min_code=5000):
         parts = line[len("MSG:"):].split(",", 3)
         if len(parts) < 4:
             continue
-        code_str, _flags, _count, rest = parts
-        try:
-            code = int(code_str)
-        except ValueError:
-            continue
-        if code < min_code:
-            continue
-        # rest is '"<formatted message>","<format>",...<params>' - the
-        # formatted message is everything up to the '","' boundary before
-        # the format-string field.
-        message = rest.split('","', 1)[0].strip().strip('"')
-        if message and message not in messages:
+        # The formatted message is everything up to the '","' boundary
+        # before the format-string field.
+        message = parts[3].split('","', 1)[0].strip().strip('"')
+        if message.startswith(("Error", "Failed", "Can't")) and message not in messages:
             messages.append(message)
     return messages
 
 
-def format_makemkv_errors(error_messages):
+def format_makemkv_errors(error_messages, limit=5):
     """Formats MakeMKV's own error messages for appending to a zenity
-    notification. Returns '' when there's nothing to show, so callers can
+    notification, showing at most `limit` of them (a bad disc can produce
+    hundreds). Returns '' when there's nothing to show, so callers can
     always append the result without an extra if-check."""
     if not error_messages:
         return ""
-    return "\n\nMakeMKV reported:\n" + "\n".join(f"- {m}" for m in error_messages)
+    shown = "\n".join(f"- {m}" for m in error_messages[:limit])
+    more = len(error_messages) - limit
+    if more > 0:
+        shown += f"\n...and {more} more (see last_disc_scan.txt in {cfg.WORK_DIR})"
+    return "\n\nMakeMKV reported:\n" + shown
+
+
+def makemkv_gui_running():
+    """True if MakeMKV's own app is open. It scans every disc as soon as
+    it's inserted, and two programs reading an encrypted DVD at once
+    break each other's decryption handshake - MakeMKV then reports
+    "READ OF SCRAMBLED SECTOR WITHOUT AUTHENTICATION" and drops titles."""
+    return subprocess.run(["pgrep", "-f", "makemkvcon guiserver"],
+                          capture_output=True).returncode == 0
+
+
+def wait_for_makemkv_gui_closed(device):
+    """Asks the user to close MakeMKV's app until it's closed. Returns False
+    (after ejecting the disc) if they cancel instead."""
+    while makemkv_gui_running():
+        choice = zenity_choice(
+            "MakeMKV's own window is open. It reads the disc at the same time "
+            "as the ripper, which makes discs come up with missing titles.\n\n"
+            "Close MakeMKV, then click OK.",
+            ["I've closed it - try again", "Rip anyway"],
+        )
+        if not choice:
+            eject_disc(device)
+            return False
+        if choice.startswith("Rip anyway"):
+            return True
+    return True
 
 
 def get_disc_titles(disc_num=0, log_name="last_disc_scan.txt"):
@@ -512,7 +540,9 @@ def encode_and_send(local_path, encoded_path, remote_dir, item_label):
 
 
 def eject_disc(device):
-    subprocess.run(["eject", device])
+    # device is None when processing a folder of existing rips (--from-folder).
+    if device:
+        subprocess.run(["eject", device])
 
 
 def ring_bell(times=2):
@@ -553,23 +583,75 @@ def prompt_required_int(prompt_text, field_label, device):
         return None
 
 
+def prompt_tmdb_show_id():
+    """Asks for a TMDB show id to use instead of searching TMDB by name -
+    optional, since most shows resolve fine by name. Useful when a show has
+    several TMDB entries (e.g. a remake with a near-identical title) and the
+    name search finds the wrong one, tagging episodes with another show's
+    names. Find the id in a show's themoviedb.org URL: .../tv/<id>-<slug>.
+    Returns None (search by name, same as before this existed) if left
+    blank, cancelled, or not a plain number."""
+    value = zenity_entry(
+        "TMDB show ID, from its themoviedb.org URL (optional - leave blank "
+        "to find it by name):"
+    )
+    if not value:
+        return None
+    if value.strip().isdigit():
+        return int(value.strip())
+    notify(f"'{value}' isn't a valid TMDB id - looking it up by name instead.")
+    return None
+
+
+def is_bluray_title(info):
+    return (info.get("source_filename") or "").lower().endswith(".mpls")
+
+
+def parse_clip_ids(segment_map):
+    """Parses a Blu-ray title's segment map into the set of raw .m2ts clip
+    ids it plays (e.g. "1100,1062" -> {1100, 1062}). These ids are global to
+    the disc, unlike a DVD's segment map, which numbers cells relative to
+    each title (every episode can be "1-6"). Returns None if there's no
+    segment map or it isn't a plain comma-separated list of integers."""
+    if not segment_map:
+        return None
+    try:
+        return frozenset(int(p) for p in segment_map.split(","))
+    except ValueError:
+        return None
+
+
 def drop_duplicate_titles(titles):
-    """Removes titles that play the same video as another title. Blu-rays
-    often list each episode under several playlists that differ only in
-    which audio/subtitle tracks they carry (e.g. a French and a Japanese
-    version of the same episode) - ripping them all would give every
-    episode twice. Titles count as the same video when both their segment
-    map (the clips/cells they play) and their size match: on a DVD the
-    segment map is cell numbers relative to each title (every episode can
-    be "1-6"), so it isn't unique on its own. Of each set of duplicates, the
-    one with the most audio + subtitle tracks is kept (ties go to the lowest
-    title index). Titles missing either value are kept as-is.
+    """Removes titles that play the same video as another title, keeping
+    one copy of each.
+
+    On Blu-ray, two titles are the same video whenever their clip sets
+    overlap completely - not only when they're identical. Discs often list
+    the same episode under several playlists that add something extra on
+    top of the same core clips: a French/Japanese dub with different
+    subtitle tracks (same clips, same size - an exact duplicate), a short
+    bumper/logo clip spliced onto the front (same clips plus one more, a few
+    seconds and a few MB different - a partial duplicate), or a "Play All"
+    title that chains every episode's clips into one compilation (every
+    episode's clips, plus more). In every case the smaller clip set is the
+    clean copy and any title whose clips are a strict superset of it is
+    dropped, since it's just that content plus filler.
+
+    On DVD, segment map numbers are cell numbers relative to each title, so
+    they aren't globally unique and overlap alone proves nothing - there,
+    two titles only count as the same video when their segment map and size
+    both match exactly, as before.
+
+    Of each set of exact duplicates, the one with the most audio + subtitle
+    tracks is kept (ties go to the lowest title index). Titles with no
+    segment map or size are always kept as-is.
     Returns a new {title_index: info} dict."""
     kept = {}
     by_video = {}
     for idx, info in sorted(titles.items()):
-        video = (info.get("segment_map"), info.get("size_bytes"))
-        if None in video:
+        clips = parse_clip_ids(info.get("segment_map")) if is_bluray_title(info) else None
+        video = clips if clips else (info.get("segment_map"), info.get("size_bytes"))
+        if not clips and None in video:
             kept[idx] = info
             continue
         current = by_video.get(video)
@@ -577,15 +659,153 @@ def drop_duplicate_titles(titles):
             by_video[video] = idx
     for idx in by_video.values():
         kept[idx] = titles[idx]
-    dropped = sorted(set(titles) - set(kept))
+
+    clip_sets = {idx: clips for idx, info in kept.items()
+                 if is_bluray_title(info) and (clips := parse_clip_ids(info.get("segment_map")))}
+    final = {
+        idx: info for idx, info in kept.items()
+        if idx not in clip_sets or not any(
+            idx2 != idx and other < clip_sets[idx] for idx2, other in clip_sets.items()
+        )
+    }
+
+    dropped = sorted(set(titles) - set(final))
     if dropped:
         print(f"Skipping duplicate title(s) {dropped} - same video as another title")
-    return dict(sorted(kept.items()))
+    return dict(sorted(final.items()))
 
 
-# How long to wait before rescanning a disc whose first scan didn't settle
-# which titles are the episodes (see choose_episode_titles).
-RESCAN_DELAY_SECONDS = 10
+@contextmanager
+def disc_mounted(device):
+    """Yields the Blu-ray's mount point as a Path, mounting the disc
+    read-only (via udisksctl, no root needed) if it isn't already mounted,
+    and unmounting it again afterwards if it was mounted here. Yields None
+    if it can't be mounted."""
+    def mount_point():
+        result = subprocess.run(["findmnt", "-n", "-o", "TARGET", "-S", device],
+                                capture_output=True, text=True)
+        return result.stdout.strip().splitlines()[0] if result.stdout.strip() else None
+
+    root = mount_point()
+    mounted_here = False
+    if root is None and device:
+        result = subprocess.run(["udisksctl", "mount", "-b", device, "-o", "ro"],
+                                capture_output=True, text=True)
+        mounted_here = result.returncode == 0
+        root = mount_point()
+    try:
+        yield Path(root) if root else None
+    finally:
+        if mounted_here:
+            subprocess.run(["udisksctl", "unmount", "-b", device], capture_output=True)
+
+
+def read_playlist_clip_seconds(playlist_path):
+    """Reads a Blu-ray playlist (BDMV/PLAYLIST/NNNNN.mpls - not encrypted, so
+    readable straight off the mounted disc) and returns the length in
+    seconds of each video clip it plays, in play order. Returns None if
+    the file can't be read or parsed."""
+    try:
+        data = playlist_path.read_bytes()
+        playlist_start = struct.unpack(">I", data[8:12])[0]
+        item_count = struct.unpack(">H", data[playlist_start + 6:playlist_start + 8])[0]
+        pos = playlist_start + 10
+        seconds = []
+        for _ in range(item_count):
+            item_length = struct.unpack(">H", data[pos:pos + 2])[0]
+            in_time, out_time = struct.unpack(">II", data[pos + 14:pos + 22])
+            seconds.append((out_time - in_time) / 45000)  # 45 kHz clock
+            pos += 2 + item_length
+        return seconds
+    except (OSError, struct.error):
+        return None
+
+
+def find_play_all_split(titles, device, pad_seconds):
+    """Looks for a Blu-ray "Play All" title to cut into episodes, for discs
+    that only offer the episodes back to back: each episode is its own
+    video clip on the disc, but has no playlist of its own, so MakeMKV
+    never lists it as a title. A Blu-ray title's playlist (its
+    source_filename, e.g. 00004.mpls) lists the clips it plays; when
+    enough of them match each other in length (see detect_episode_titles),
+    those clips are the episodes. Titles are tried longest first.
+    Returns (title_index, clip_seconds, episode_clips) - clip_seconds is
+    every clip's length in play order, episode_clips the indices of the
+    clips that are episodes (a short intro clip isn't) - or None."""
+    playlists = [(info.get("duration_seconds", 0), idx, info["source_filename"])
+                 for idx, info in titles.items()
+                 if (info.get("source_filename") or "").lower().endswith(".mpls")]
+    if not playlists:
+        return None
+    with disc_mounted(device) as root:
+        if root is None:
+            print("Couldn't mount the disc to read its playlists")
+            return None
+        for _duration, idx, playlist in sorted(playlists, reverse=True):
+            clip_seconds = read_playlist_clip_seconds(root / "BDMV" / "PLAYLIST" / playlist)
+            if not clip_seconds or len(clip_seconds) < 2:
+                continue
+            clips = {i: {"duration_seconds": int(s)} for i, s in enumerate(clip_seconds)}
+            episode_clips, certain = detect_episode_titles(clips, pad_seconds)
+            if certain:
+                return idx, clip_seconds, episode_clips
+    return None
+
+
+def split_play_all(raw_dir, clip_seconds, episode_clips):
+    """Cuts a ripped "Play All" title (see find_play_all_split) into one
+    file per episode, at the points where the disc's clips join - no
+    re-encoding, just copying. MakeMKV puts a chapter mark at each join,
+    so a calculated cut point within a few seconds of a chapter snaps to
+    it. Each episode is copied out with its own ffmpeg run that seeks to
+    its start: ffmpeg's segment muxer can't be used, since MakeMKV's VC-1
+    video has no presentation timestamps for it to cut on. A seek can land
+    a fraction of a second off the join, which on these discs falls in the
+    black between episodes.
+    The episode files are written as episode_t00.mkv, episode_t01.mkv...
+    in play order (matching guess_episode_order's '_t<NN>' naming) and the
+    Play All file is deleted. Returns the episode file paths."""
+    source = max(Path(raw_dir).glob("*.mkv"), key=lambda f: f.stat().st_size)
+    chapters = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "chapter=start_time",
+         "-of", "csv=p=0", str(source)],
+        capture_output=True, text=True,
+    ).stdout.split()
+    chapter_starts = [float(c) for c in chapters if c.replace(".", "", 1).isdigit()]
+
+    def snap(seconds):
+        nearest = min(chapter_starts, key=lambda c: abs(c - seconds), default=None)
+        return nearest if nearest is not None and abs(nearest - seconds) <= 3 else seconds
+
+    # Clip k plays from bounds[k] to bounds[k + 1]; the last runs to the end.
+    bounds = [0.0] + [snap(sum(clip_seconds[:k])) for k in range(1, len(clip_seconds))] + [None]
+    print("Cutting the Play All title into episodes at "
+          + ", ".join(f"{b / 60:.1f}" for b in bounds[1:-1]) + " min")
+    progress = zenity_progress_pulse(f"Cutting the Play All title into {len(episode_clips)} episodes...")
+    episode_files = []
+    try:
+        for n, clip in enumerate(episode_clips):
+            start, end = bounds[clip], bounds[clip + 1]
+            episode_file = Path(raw_dir, f"episode_t{n:02d}.mkv")
+            subprocess.run(
+                ["ffmpeg", "-y", "-v", "error",
+                 *(["-ss", f"{start:.3f}"] if start else []), "-i", str(source),
+                 *(["-t", f"{end - start:.3f}"] if end is not None else []),
+                 "-map", "0", "-c", "copy", str(episode_file)],
+                stdin=subprocess.DEVNULL, check=True,
+            )
+            episode_files.append(episode_file)
+    finally:
+        progress.terminate()
+    source.unlink()
+    return episode_files
+
+
+# Rescans for a disc whose first scan didn't settle which titles are the
+# episodes (see choose_episode_titles). A scratched disc can make the drive
+# reset mid-scan, and it needs a while before it reads again.
+RESCAN_ATTEMPTS = 3
+RESCAN_DELAY_SECONDS = 30
 
 
 def detect_episode_titles(titles, pad_seconds):
@@ -661,26 +881,41 @@ def choose_episode_titles(titles, disc_errors, device):
     """Picks the disc title indices to rip as episodes. They're picked
     automatically by matching lengths (see detect_episode_titles, with
     cfg.EPISODE_LENGTH_PAD_MINUTES as the tolerance). If that's not
-    conclusive, the disc is scanned once more first - a scan that runs while
-    the disc is still spinning up can come back with only some of its
-    titles - and the user is asked, once, only if the rescan doesn't settle
-    it either. MakeMKV's own errors from the scan used (disc_errors, see
+    conclusive, the disc is rescanned (up to RESCAN_ATTEMPTS times) - read
+    errors on a scratched disc can make MakeMKV drop titles it already
+    found, or the drive reset mid-scan, but a later scan often reads it
+    fine. The scan with the most titles is used, and the user is asked,
+    once, only if none of them settles it. MakeMKV's own errors from the scan used (disc_errors, see
     get_disc_titles) are shown in the abort dialog and the checklist.
-    Returns (title_indices, titles), where titles is the scan actually
-    used, or None if there's nothing to rip (the disc has already
-    been ejected by then)."""
-    best, certain = detect_episode_titles(drop_duplicate_titles(titles),
-                                          cfg.EPISODE_LENGTH_PAD_MINUTES * 60)
+    Before rescanning, a Blu-ray that only offers its episodes as one
+    "Play All" title is checked for (see find_play_all_split) - then that
+    title is ripped and cut into episodes instead.
+    Returns (title_indices, titles, split), where titles is the scan
+    actually used and split is None or the (clip_seconds, episode_clips)
+    to cut the single ripped title at (see split_play_all) - or None if
+    there's nothing to rip (the disc has already been ejected by then)."""
+    pad_seconds = cfg.EPISODE_LENGTH_PAD_MINUTES * 60
+    best, certain = detect_episode_titles(drop_duplicate_titles(titles), pad_seconds)
     if not certain:
-        print(f"Couldn't pick the episodes from {len(titles)} title(s) - "
-              f"rescanning the disc in {RESCAN_DELAY_SECONDS}s in case it wasn't fully read")
+        play_all = find_play_all_split(drop_duplicate_titles(titles), device, pad_seconds)
+        if play_all:
+            idx, clip_seconds, episode_clips = play_all
+            lengths = ", ".join(f"{clip_seconds[c] / 60:.0f}" for c in episode_clips)
+            print(f"Title {idx} is a Play All of {len(episode_clips)} episode(s) with no titles "
+                  f"of their own (lengths in min: {lengths}) - ripping it and cutting it up")
+            return [idx], titles, (clip_seconds, episode_clips)
+
+    attempt = 0
+    while not certain and attempt < RESCAN_ATTEMPTS:
+        attempt += 1
+        print(f"Couldn't pick the episodes from {len(titles)} title(s) - rescanning in "
+              f"{RESCAN_DELAY_SECONDS}s (attempt {attempt} of {RESCAN_ATTEMPTS})")
         time.sleep(RESCAN_DELAY_SECONDS)
-        rescanned, rescan_errors = get_disc_titles(log_name="last_disc_rescan.txt")
+        rescanned, rescan_errors = get_disc_titles(log_name=f"last_disc_rescan_{attempt}.txt")
         if len(rescanned) > len(titles):
             print(f"Rescan found {len(rescanned)} title(s) - using it")
             titles, disc_errors = rescanned, rescan_errors
-            best, certain = detect_episode_titles(drop_duplicate_titles(titles),
-                                                  cfg.EPISODE_LENGTH_PAD_MINUTES * 60)
+            best, certain = detect_episode_titles(drop_duplicate_titles(titles), pad_seconds)
 
     if not titles:
         notify("MakeMKV couldn't read any titles from this disc - "
@@ -689,7 +924,7 @@ def choose_episode_titles(titles, disc_errors, device):
     if certain:
         lengths = ", ".join(f"{titles[i]['duration_seconds'] / 60:.0f}" for i in best)
         print(f"Detected {len(best)} episode title(s): {best} (lengths in min: {lengths})")
-        return best, titles
+        return best, titles, None
 
     # Don't eject before asking - the disc is still needed to rip the choice.
     # A "group" too small to count as matching isn't worth pre-ticking - on
@@ -697,15 +932,18 @@ def choose_episode_titles(titles, disc_errors, device):
     ring_bell()
     suggested = best if len(best) >= cfg.EPISODE_DETECT_MIN_TITLES else []
     chosen = ask_episode_titles(drop_duplicate_titles(titles), suggested, disc_errors, device)
-    return (chosen, titles) if chosen else None
+    return (chosen, titles, None) if chosen else None
 
 
 def handle_movie(raw_dir, title, year, device):
+    """Encodes and sends the movie. Returns True if it made it to the
+    server - the caller uses this to decide whether the raw rip is safe to
+    delete."""
     # Find the ripped file with the longest runtime - almost always the movie itself
     mkv_files = list(Path(raw_dir).glob("*.mkv"))
     if not mkv_files:
         notify("No files were ripped - check MakeMKV output.", device=device)
-        return
+        return False
 
     mkv_files.sort(key=get_duration_seconds, reverse=True)
     main_file = mkv_files[0]
@@ -714,15 +952,25 @@ def handle_movie(raw_dir, title, year, device):
     output_name = f"{folder_name}.mkv"
     encoded_path = Path(cfg.ENCODED_DIR) / folder_name / output_name
 
-    if encode_and_send(main_file, encoded_path, f"{cfg.REMOTE_MOVIES_PATH}/{folder_name}", folder_name):
+    success = encode_and_send(main_file, encoded_path, f"{cfg.REMOTE_MOVIES_PATH}/{folder_name}", folder_name)
+    if success:
         notify(f"Done! {folder_name} has been encoded and sent to the media server.", device=device)
+    return success
 
 
-def handle_tv(raw_dir, show_name, season_num, device, titles):
-    mkv_files = list(Path(raw_dir).glob("*.mkv"))
+def handle_tv(mkv_files, show_name, season_num, device, titles, tmdb_id=None):
+    """Encodes and sends every chosen episode. Returns True only if all of
+    them made it to the server - the caller uses this to decide whether the
+    raw rip is safe to delete, so a partial failure (e.g. a GPU driver
+    problem mid-batch) doesn't cost you the whole disc's rip.
+
+    tmdb_id, if given, is used as the show's TMDB id as-is instead of
+    searching for it by name - some shows have several TMDB entries (e.g. a
+    remake sharing a near-identical title) where the name search finds the
+    wrong one and tags episodes with another show's names."""
     if not mkv_files:
         notify("No files were ripped - check MakeMKV output.", device=device)
-        return
+        return False
 
     guesses = guess_episode_order(mkv_files, titles)
     season_folder = f"Season {season_num:02d}"
@@ -740,7 +988,7 @@ def handle_tv(raw_dir, show_name, season_num, device, titles):
         start_note = "no episodes of this season on the server yet"
     # Looked up once per disc rather than per episode - it's the same show
     # for every file, no need to hit TMDB's search endpoint repeatedly.
-    show_id = tmdb_find_show_id(show_name)
+    show_id = tmdb_id if tmdb_id is not None else tmdb_find_show_id(show_name)
 
     # Every ripped title was already picked as an episode, so it's numbered
     # automatically from the guessed order (see guess_episode_order). The
@@ -779,7 +1027,7 @@ def handle_tv(raw_dir, show_name, season_num, device, titles):
     total = len(episodes)
     if total == 0:
         notify(f"No episodes selected for {show_name} - nothing to transfer.", device=device)
-        return
+        return False
 
     transferred = []
     for f, episode_num in episodes:
@@ -800,6 +1048,7 @@ def handle_tv(raw_dir, show_name, season_num, device, titles):
     notify(f"Done! {len(transferred)} of {total} episode(s) for {show_name} transferred "
            "to the media server:\n\n" + "\n".join(transferred),
            device=device)
+    return len(transferred) == total
 
 
 def main():
@@ -839,6 +1088,11 @@ def main():
                 if season_num is None:
                     continue
 
+                tmdb_id = prompt_tmdb_show_id()
+
+            if not wait_for_makemkv_gui_closed(device):
+                continue
+
             raw_dir = os.path.join(cfg.RAW_RIP_DIR, str(int(time.time())))
             try:
                 titles, disc_errors = get_disc_titles()
@@ -848,6 +1102,7 @@ def main():
                 print(f"Command failed: {e}", file=sys.stderr)
                 continue
 
+            all_done = False
             try:
                 if content_type == "Movie":
                     title_index = choose_main_title(titles, disc_errors, device)
@@ -860,24 +1115,94 @@ def main():
                     chosen = choose_episode_titles(titles, disc_errors, device)
                     if chosen is None:
                         continue
-                    episode_indices, titles = chosen
+                    episode_indices, titles, split = chosen
                     rip_titles(raw_dir, episode_indices)
+                    if split:
+                        split_files = split_play_all(raw_dir, *split)
+                        # The cut-up files are already in play order, and
+                        # named to match these placeholder titles.
+                        titles = {n: {} for n in range(len(split_files))}
             except subprocess.CalledProcessError as e:
-                notify(f"MakeMKV failed (exit code {e.returncode}) - aborting this disc. "
+                notify(f"{Path(e.cmd[0]).name} failed (exit code {e.returncode}) - aborting this disc. "
                        "Check the terminal for details.", device=device)
                 print(f"Command failed: {e}", file=sys.stderr)
             else:
                 if content_type == "Movie":
-                    handle_movie(raw_dir, title, year, device)
+                    all_done = handle_movie(raw_dir, title, year, device)
                 else:
-                    handle_tv(raw_dir, show_name, season_num, device, titles)
+                    all_done = handle_tv(list(Path(raw_dir).glob("*.mkv")), show_name, season_num,
+                                          device, titles, tmdb_id)
 
-            # Clean up raw rip to save disk space now that encoding is done
-            shutil.rmtree(raw_dir, ignore_errors=True)
+            # Only reclaim the raw rip once everything in it has been
+            # encoded and sent - a failed rip, encode or transfer (e.g. the
+            # GPU driver mismatch that silently zeroed out a whole batch of
+            # NVENC encodes) leaves the raw files in place so the disc
+            # doesn't have to be re-ripped to retry.
+            if all_done:
+                shutil.rmtree(raw_dir, ignore_errors=True)
+            else:
+                print(f"Leaving raw rip in {raw_dir} - not everything was encoded and sent. "
+                      "Fix the problem and retry (e.g. with --from-folder), or delete it "
+                      "manually.", file=sys.stderr)
     except KeyboardInterrupt:
         print("\nCtrl+C received - shutting down.")
         sys.exit(0)
 
 
+def process_folder(folder):
+    """Numbers, encodes and sends a folder of .mkv files that were ripped
+    some other way (e.g. with MakeMKV's own app, for a disc the watcher
+    can't read reliably), as a TV season - the same steps the watcher runs
+    after its own rip. The episodes are picked from the files by matching
+    lengths, like disc titles are (see detect_episode_titles), so a Play
+    All or extras ripped along with them are skipped; if that's not
+    conclusive the user ticks them in the same one-time checklist. There's
+    no disc title list, so episode order comes from MakeMKV's '_t<NN>' file
+    naming (see guess_episode_order). The folder itself is left untouched."""
+    folder = Path(folder).expanduser()
+    files = sorted(folder.glob("*.mkv"))
+    if not files:
+        sys.exit(f"No .mkv files in {folder}")
+    os.makedirs(cfg.WORK_DIR, exist_ok=True)
+
+    show_name = prompt_required("Show name:", "show name", None)
+    if show_name is None:
+        return
+    season_num = prompt_required_int("Season number (e.g. 1):", "season", None)
+    if season_num is None:
+        return
+    tmdb_id = prompt_tmdb_show_id()
+
+    # Keyed by position in `files`, shaped like get_disc_titles' output so
+    # the disc-title helpers work on it.
+    titles = {i: {"duration_seconds": int(get_duration_seconds(f)), "name": f.name}
+              for i, f in enumerate(files)}
+    best, certain = detect_episode_titles(titles, cfg.EPISODE_LENGTH_PAD_MINUTES * 60)
+    if certain:
+        chosen = best
+        skipped = [files[i].name for i in titles if i not in best]
+        if skipped:
+            print(f"Skipping {len(skipped)} file(s) that don't match the episode length: "
+                  + ", ".join(skipped))
+    else:
+        suggested = best if len(best) >= cfg.EPISODE_DETECT_MIN_TITLES else []
+        chosen = ask_episode_titles(titles, suggested, [], None)
+        if not chosen:
+            return
+
+    handle_tv([files[i] for i in chosen], sanitize(show_name), season_num, None, {}, tmdb_id)
+
+
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(
+        description="Watch for discs, then rip, encode and send them to the media server.")
+    parser.add_argument(
+        "--from-folder", metavar="DIR",
+        help="process existing TV episode .mkv files in DIR (number, encode, send) "
+             "instead of watching for discs",
+    )
+    args = parser.parse_args()
+    if args.from_folder:
+        process_folder(args.from_folder)
+    else:
+        main()
