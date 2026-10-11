@@ -559,10 +559,11 @@ def sanitize(name):
     return "".join(c for c in name if c not in '/\\:*?"<>|').strip()
 
 
-def prompt_required(prompt_text, field_label, device):
-    """Prompts for a value. On empty input, notifies, ejects the disc, and
-    returns None so the caller can abort this disc and continue the loop."""
-    value = zenity_entry(prompt_text)
+def prompt_required(prompt_text, field_label, device, default_text=None):
+    """Prompts for a value, pre-filled with default_text if given. On empty
+    input, notifies, ejects the disc, and returns None so the caller can
+    abort this disc and continue the loop."""
+    value = zenity_entry(prompt_text, default_text=default_text)
     if not value:
         notify(f"No {field_label} entered - aborting.")
         eject_disc(device)
@@ -570,9 +571,9 @@ def prompt_required(prompt_text, field_label, device):
     return value
 
 
-def prompt_required_int(prompt_text, field_label, device):
+def prompt_required_int(prompt_text, field_label, device, default_text=None):
     """Like prompt_required, but also validates the input parses as an int."""
-    value = prompt_required(prompt_text, field_label, device)
+    value = prompt_required(prompt_text, field_label, device, default_text=default_text)
     if value is None:
         return None
     try:
@@ -1056,6 +1057,9 @@ def main():
     ensure_all_subtitles_selected()
     print("Disc ripper running. Press Ctrl+C to stop.")
 
+    last_show_name = None
+    last_season_num = None
+
     try:
         while True:
             device = wait_for_disc()
@@ -1079,14 +1083,20 @@ def main():
                     continue
                 title, year = sanitize(title), sanitize(year)
             else:
-                show_name = prompt_required("Show name:", "show name", device)
+                # Pre-filled with the previous disc's answers - consecutive
+                # discs are almost always the same show and season.
+                show_name = prompt_required("Show name:", "show name", device,
+                                             default_text=last_show_name)
                 if show_name is None:
                     continue
                 show_name = sanitize(show_name)
 
-                season_num = prompt_required_int("Season number (e.g. 1):", "season", device)
+                season_num = prompt_required_int("Season number (e.g. 1):", "season", device,
+                                                  default_text=last_season_num)
                 if season_num is None:
                     continue
+
+                last_show_name, last_season_num = show_name, season_num
 
                 tmdb_id = prompt_tmdb_show_id()
 
