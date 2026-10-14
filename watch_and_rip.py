@@ -584,17 +584,19 @@ def prompt_required_int(prompt_text, field_label, device, default_text=None):
         return None
 
 
-def prompt_tmdb_show_id():
+def prompt_tmdb_show_id(default_id=None):
     """Asks for a TMDB show id to use instead of searching TMDB by name -
     optional, since most shows resolve fine by name. Useful when a show has
     several TMDB entries (e.g. a remake with a near-identical title) and the
     name search finds the wrong one, tagging episodes with another show's
     names. Find the id in a show's themoviedb.org URL: .../tv/<id>-<slug>.
+    The entry is pre-filled with default_id if given.
     Returns None (search by name, same as before this existed) if left
     blank, cancelled, or not a plain number."""
     value = zenity_entry(
         "TMDB show ID, from its themoviedb.org URL (optional - leave blank "
-        "to find it by name):"
+        "to find it by name):",
+        default_text=default_id,
     )
     if not value:
         return None
@@ -1059,6 +1061,7 @@ def main():
 
     last_show_name = None
     last_season_num = None
+    last_tmdb_id = None
 
     try:
         while True:
@@ -1096,9 +1099,13 @@ def main():
                 if season_num is None:
                     continue
 
+                # A TMDB id only carries over while it's the same show -
+                # another show's id would tag episodes with the wrong names.
+                same_show = show_name == last_show_name
                 last_show_name, last_season_num = show_name, season_num
 
-                tmdb_id = prompt_tmdb_show_id()
+                tmdb_id = prompt_tmdb_show_id(last_tmdb_id if same_show else None)
+                last_tmdb_id = tmdb_id
 
             if not wait_for_makemkv_gui_closed(device):
                 continue
