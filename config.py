@@ -24,7 +24,8 @@ ENCODED_DIR = WORK_DIR + "/encoded"      # FFmpeg output lands here
 MAKEMKV_MIN_LENGTH_SECONDS = 3900        # 65 min
 
 # How close (+/- minutes) title lengths must be to count as "matching" for
-# a TV rip. The largest group of matching titles is ripped as the episodes;
+# a TV rip. The group of matching titles with the most total running time
+# is ripped as the episodes;
 # if that's not conclusive you're asked once, with a checklist of titles.
 EPISODE_LENGTH_PAD_MINUTES = 2
 

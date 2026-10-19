@@ -85,11 +85,17 @@ Leave the terminal open. Insert a disc:
     audio/subtitle tracks; the one with the most tracks is kept. Titles only
     count as the same video when both the segments they play and their size
     match (on DVDs, different episodes often share segment numbers).
-  - Since every episode in a season runs about the same length, the biggest
-    group of titles whose lengths match (within ± `EPISODE_LENGTH_PAD_MINUTES`
-    in `config.py`, default 2 min) is ripped as the episodes. Titles under
-    `EPISODE_DETECT_MIN_SECONDS` (5 min) are ignored. A "Play All"
-    compilation is several episodes long, so it never matches.
+  - Since every episode in a season runs about the same length, titles are
+    grouped by matching length (within ± `EPISODE_LENGTH_PAD_MINUTES` in
+    `config.py`, default 2 min), and the group with the **most total
+    running time** is ripped as the episodes. Episodes are the disc's main
+    content, so they add up to more than a set of short featurettes, even
+    when there are more featurettes than episodes. Titles under
+    `EPISODE_DETECT_MIN_SECONDS` (5 min) are ignored, and a group needs at
+    least `EPISODE_DETECT_MIN_TITLES` (2) titles, so a lone "Play All" can't
+    win. A title whose length is exactly the sum of other titles is a Play
+    All too, and a group made only of those (e.g. two Play Alls of similar
+    length) is skipped.
   - Some Blu-rays only offer the episodes back to back as one "Play All"
     title: each episode is its own video clip on the disc but has no title
     of its own, so MakeMKV never lists it. If the lengths don't settle
@@ -100,7 +106,8 @@ Leave the terminal open. Insert a disc:
     re-encoding. That takes about twice the title's size in `WORK_DIR`
     for a moment. The episodes are numbered in play order.
   - If that's not conclusive either (fewer than `EPISODE_DETECT_MIN_TITLES` titles
-    match, or two different groups are equally big), the disc is rescanned
+    match, or another group comes within 70% of the winner's total running
+    time), the disc is rescanned
     up to 3 times, 30 seconds apart. Read errors on a scratched disc can make
     MakeMKV drop titles, or the drive reset mid-scan, but a later scan often
     reads it fine. If none settles it, you're asked **once**:
@@ -174,9 +181,9 @@ them from TMDB, encodes, and sends. Episode order comes from the `_t01`,
   in `WORK_DIR`. Errors MakeMKV reports also show up in the abort dialogs
   and the episode checklist. If the ripper picks the wrong titles, check there first.
 - **TV episode detection**: if the padding is too narrow, real episodes
-  can miss the matching group and never get ripped. Detection can also
-  pick the wrong group on a disc with more same-length bonus features than
-  episodes. The chosen titles (and any duplicates skipped) are printed in
+  can miss the matching group and never get ripped. An extended cut a few
+  minutes longer than the other episodes is left out for the same reason.
+  The chosen titles (and any duplicates skipped) are printed in
   the terminal - if a disc comes up with fewer episodes than expected,
   check those lines and the padding first.
 - **TV numbering**: episodes are numbered automatically when the guess is

@@ -56,11 +56,14 @@ def zenity_entry(prompt, title="Disc Ripper", default_text=None):
     return result.stdout.strip()
 
 
-def zenity_choice(prompt, options, title="Disc Ripper"):
+def zenity_choice(prompt, options, title="Disc Ripper", default=None):
+    """Asks the user to pick one of options. default is pre-selected if it's
+    one of them, otherwise the first option is."""
+    selected = options.index(default) if default in options else 0
     result = subprocess.run(
         ["zenity", "--list", "--radiolist", "--text", prompt,
          "--column", "", "--column", "Option",
-         *sum([["TRUE" if i == 0 else "FALSE", opt] for i, opt in enumerate(options)], []),
+         *sum([["TRUE" if i == selected else "FALSE", opt] for i, opt in enumerate(options)], []),
          "--title", title, "--hide-header"],
         capture_output=True, text=True
     )
@@ -810,41 +813,86 @@ def split_play_all(raw_dir, clip_seconds, episode_clips):
 RESCAN_ATTEMPTS = 3
 RESCAN_DELAY_SECONDS = 30
 
+# How close a "Play All" title's length must be to the sum of the titles it
+# chains, per title - MakeMKV rounds each length to the second.
+PLAY_ALL_TOLERANCE_SECONDS = 3
+
+# Episode detection is only certain when the runner-up group of matching
+# titles has less than this fraction of the winning group's total runtime.
+EPISODE_DETECT_RUNNER_UP_RATIO = 0.7
+
+
+def is_play_all(duration, other_durations):
+    """True if duration equals the sum of two or more of other_durations
+    (within PLAY_ALL_TOLERANCE_SECONDS per title summed) - i.e. the title is
+    probably a "Play All" that chains those titles together."""
+    # sums[k] = every total reachable by adding up k titles (k capped at 2,
+    # standing for "2 or more"), mapped to how many titles went into it.
+    sums = {0: {0: 0}, 1: {}, 2: {}}
+    for d in other_durations:
+        for k in (2, 1, 0):
+            for total, count in list(sums[k].items()):
+                new_total = total + d
+                if new_total > duration + PLAY_ALL_TOLERANCE_SECONDS * (count + 1):
+                    continue
+                bucket = sums[min(k + 1, 2)]
+                bucket[new_total] = min(bucket.get(new_total, count + 1), count + 1)
+    return any(abs(total - duration) <= PLAY_ALL_TOLERANCE_SECONDS * count
+               for total, count in sums[2].items())
+
 
 def detect_episode_titles(titles, pad_seconds):
     """Picks the disc titles that are probably the episodes, on the basis
     that every episode in a season runs about the same length: titles are
     grouped by matching length (durations within 2 * pad_seconds of each
-    other), and the largest group wins. A "Play All" compilation is several
-    episodes long, so it never matches the episodes themselves. Titles
-    under cfg.EPISODE_DETECT_MIN_SECONDS (menus, logos, short clips) are
-    ignored.
+    other), and the group with the most total runtime wins - episodes are
+    the disc's main content, so they add up to far more than a handful of
+    same-length featurettes, even when the featurettes outnumber them.
+    Titles under cfg.EPISODE_DETECT_MIN_SECONDS (menus, logos, short clips)
+    are ignored, and a group needs at least cfg.EPISODE_DETECT_MIN_TITLES
+    titles, so a lone "Play All" compilation can't win on runtime. A group
+    whose titles are all Play Alls (each one's length is the sum of other
+    titles - see is_play_all), e.g. two Play Alls of similar length, is
+    skipped too.
 
-    Returns (best_indices, certain). best_indices is the largest group (on a
-    tie, the one with the longer titles, since bonus featurettes tend to be
-    shorter than episodes) or [] if there are no candidate titles at all.
-    certain is False when the group has fewer than
-    cfg.EPISODE_DETECT_MIN_TITLES titles or another, different group is just
-    as large - i.e. when length alone can't say which titles are episodes."""
+    Returns (best_indices, certain). best_indices is the winning group, or
+    [] if no group qualifies. certain is False when no group qualifies or
+    another group of matching titles, with none of the same titles, comes
+    within EPISODE_DETECT_RUNNER_UP_RATIO of its total runtime - i.e. when
+    length alone can't say which titles are episodes. Then best_indices is
+    whichever of those close groups has the longest titles, as the best
+    guess to suggest."""
     candidates = sorted(
         (info["duration_seconds"], idx) for idx, info in titles.items()
         if info.get("duration_seconds", 0) >= cfg.EPISODE_DETECT_MIN_SECONDS
     )
-    groups = []  # (count, total_seconds, indices)
+    groups = []  # (total_seconds, indices)
     for lo in range(len(candidates)):
         hi = lo
         while hi + 1 < len(candidates) and candidates[hi + 1][0] - candidates[lo][0] <= 2 * pad_seconds:
             hi += 1
         group = candidates[lo:hi + 1]
-        groups.append((len(group), sum(d for d, _ in group), sorted(i for _, i in group)))
+        if len(group) < cfg.EPISODE_DETECT_MIN_TITLES:
+            continue
+        members = {i for _, i in group}
+        others = [d for d, i in candidates if i not in members]
+        if all(is_play_all(d, others) for d, _ in group):
+            continue
+        groups.append((sum(d for d, _ in group), sorted(members)))
     if not groups:
         return [], False
 
-    groups.sort(key=lambda g: g[:2], reverse=True)
-    best_count, _total, best = groups[0]
-    tied = any(count == best_count and indices != best for count, _t, indices in groups[1:])
-    certain = best_count >= cfg.EPISODE_DETECT_MIN_TITLES and not tied
-    return best, certain
+    groups.sort(reverse=True)
+    best_total, best = groups[0]
+    close = [indices for total, indices in groups[1:]
+             if not set(indices) & set(best) and total >= EPISODE_DETECT_RUNNER_UP_RATIO * best_total]
+    if not close:
+        return best, True
+    # Too close to call - suggest the group with the longest titles, since
+    # bonus featurettes tend to be shorter than episodes.
+    def average_length(indices):
+        return sum(titles[i]["duration_seconds"] for i in indices) / len(indices)
+    return max([best] + close, key=average_length), False
 
 
 def ask_episode_titles(titles, suggested, disc_errors, device):
@@ -930,11 +978,8 @@ def choose_episode_titles(titles, disc_errors, device):
         return best, titles, None
 
     # Don't eject before asking - the disc is still needed to rip the choice.
-    # A "group" too small to count as matching isn't worth pre-ticking - on
-    # a disc where nothing matched it's usually just the Play All title.
     ring_bell()
-    suggested = best if len(best) >= cfg.EPISODE_DETECT_MIN_TITLES else []
-    chosen = ask_episode_titles(drop_duplicate_titles(titles), suggested, disc_errors, device)
+    chosen = ask_episode_titles(drop_duplicate_titles(titles), best, disc_errors, device)
     return (chosen, titles, None) if chosen else None
 
 
@@ -1059,6 +1104,7 @@ def main():
     ensure_all_subtitles_selected()
     print("Disc ripper running. Press Ctrl+C to stop.")
 
+    last_content_type = None
     last_show_name = None
     last_season_num = None
     last_tmdb_id = None
@@ -1068,13 +1114,16 @@ def main():
             device = wait_for_disc()
             time.sleep(2)  # let the disc finish spinning up before MakeMKV touches it
 
+            # Pre-selects the previous disc's answer, like the TV prompts below.
             content_type = zenity_choice(
                 "What's on this disc?",
-                ["Movie", "TV Show"]
+                ["Movie", "TV Show"],
+                default=last_content_type,
             )
             if not content_type:
                 eject_disc(device)
                 continue
+            last_content_type = content_type
 
             # Collect metadata up front, before the (long) rip runs.
             if content_type == "Movie":
@@ -1202,8 +1251,7 @@ def process_folder(folder):
             print(f"Skipping {len(skipped)} file(s) that don't match the episode length: "
                   + ", ".join(skipped))
     else:
-        suggested = best if len(best) >= cfg.EPISODE_DETECT_MIN_TITLES else []
-        chosen = ask_episode_titles(titles, suggested, [], None)
+        chosen = ask_episode_titles(titles, best, [], None)
         if not chosen:
             return
 
