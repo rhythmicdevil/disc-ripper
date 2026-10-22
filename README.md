@@ -156,12 +156,24 @@ folder to the script:
 uv run watch_and_rip.py --from-folder ~/Videos/ARCHER_S6_D2
 ```
 
-It asks for the show name and season, then does everything the watcher
-does after ripping: picks the episodes by matching length (so a Play All or
-extras ripped along with them are skipped, with the same one-time checklist
-if it can't tell), numbers them on from what's already on the server, names
-them from TMDB, encodes, and sends. Episode order comes from the `_t01`,
-`_t02`… in MakeMKV's file names. The folder itself isn't changed or deleted.
+What it does depends on how the files are named. The folder itself isn't
+changed or deleted either way.
+
+- **Named as episodes** (`Buffy the Vampire Slayer - S06E01 - Bargaining.mkv`,
+  `Show S06E01.mkv`, `Show.Name.S06E01E02.mkv`): sent exactly as named, with
+  no questions. The show name and season are read from the file names and
+  pick the folder on the server (`Show/Season 06`), and each file keeps its
+  own name. Nothing is detected, renumbered or looked up on TMDB, so a double
+  episode or anything else you've numbered by hand goes through untouched.
+  Every file needs a name like this, for the same show and season;
+  otherwise the script stops and lists the ones that don't fit.
+- **MakeMKV's own names** (`title_t00.mkv`): it asks for the show name and
+  season, then does everything the watcher does after ripping: picks the
+  episodes by matching length (so a Play All or extras ripped along with
+  them are skipped, with the same one-time checklist if it can't tell),
+  numbers them on from what's already on the server, names them from TMDB,
+  encodes, and sends. Episode order comes from the `_t01`, `_t02`… in the
+  file names.
 
 ## Notes / things to double check
 

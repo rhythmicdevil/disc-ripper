@@ -1215,21 +1215,93 @@ def main():
         sys.exit(0)
 
 
+# A file someone has already named as an episode: "Show - S06E01 - Title.mkv",
+# "Show S06E01.mkv", "Show.Name.S06E01E02.mkv", etc.
+EPISODE_FILENAME_RE = re.compile(
+    r"^(?P<show>.+?)[\s._-]*S(?P<season>\d{1,2})E(?P<episode>\d{1,3})(?:-?E\d{1,3})*\b.*\.mkv$",
+    re.IGNORECASE,
+)
+
+
+def parse_episode_filename(filename):
+    """Reads the show name, season and episode number out of a file named
+    as an episode (see EPISODE_FILENAME_RE). Dots or underscores standing
+    in for spaces in the show name are turned back into spaces. Returns
+    (show_name, season_num, episode_num), or None if the name doesn't
+    follow that pattern."""
+    match = EPISODE_FILENAME_RE.match(filename)
+    if not match:
+        return None
+    show_name = match.group("show")
+    if " " not in show_name:
+        show_name = re.sub(r"[._]+", " ", show_name)
+    show_name = sanitize(show_name.strip(" -._"))
+    if not show_name:
+        return None
+    return show_name, int(match.group("season")), int(match.group("episode"))
+
+
+def send_named_episodes(named):
+    """Encodes and sends files that are already named as episodes (see
+    parse_episode_filename) as they are: the show name and season come
+    from the file names and pick the folder on the server, and each file
+    keeps its own name - no detection, renumbering or TMDB lookup, since
+    whoever named them knew better (e.g. a double episode that runs twice
+    as long as the rest). named is a list of (path, (show, season,
+    episode)) all for the same show and season."""
+    show_name, season_num, _ = named[0][1]
+    season_folder = f"Season {season_num:02d}"
+    remote_season_dir = f"{cfg.REMOTE_TV_PATH}/{show_name}/{season_folder}"
+    named = sorted(named, key=lambda item: item[1][2])
+    print(f"Sending {len(named)} named episode(s) of {show_name} {season_folder} as named:")
+    for f, _ in named:
+        print(f"  {f.name}")
+
+    transferred = []
+    for f, _ in named:
+        encoded_path = Path(cfg.ENCODED_DIR) / show_name / season_folder / f.name
+        label = f"{f.name} ({len(transferred) + 1} of {len(named)})"
+        if encode_and_send(f, encoded_path, remote_season_dir, label):
+            transferred.append(f.name)
+    notify(f"Done! {len(transferred)} of {len(named)} episode(s) for {show_name} transferred "
+           "to the media server:\n\n" + "\n".join(transferred))
+
+
 def process_folder(folder):
-    """Numbers, encodes and sends a folder of .mkv files that were ripped
-    some other way (e.g. with MakeMKV's own app, for a disc the watcher
-    can't read reliably), as a TV season - the same steps the watcher runs
-    after its own rip. The episodes are picked from the files by matching
-    lengths, like disc titles are (see detect_episode_titles), so a Play
-    All or extras ripped along with them are skipped; if that's not
-    conclusive the user ticks them in the same one-time checklist. There's
-    no disc title list, so episode order comes from MakeMKV's '_t<NN>' file
-    naming (see guess_episode_order). The folder itself is left untouched."""
+    """Encodes and sends a folder of .mkv files that were ripped some other
+    way (e.g. with MakeMKV's own app, for a disc the watcher can't read
+    reliably), as a TV season. The folder itself is left untouched.
+
+    If every file is already named as an episode ("Show - S06E01 -
+    Title.mkv"), they're sent exactly as named (see send_named_episodes).
+    If none are - MakeMKV's own 'title_t00.mkv' naming - the same steps the
+    watcher runs after its own rip are used: the user is asked for the show
+    and season, the episodes are picked from the files by matching lengths
+    like disc titles are (see detect_episode_titles), with the same
+    one-time checklist if that's not conclusive, then numbered on from the
+    server in '_t<NN>' order (see guess_episode_order). A mix of the two,
+    or named files for more than one show or season, is refused rather
+    than guessed at."""
     folder = Path(folder).expanduser()
     files = sorted(folder.glob("*.mkv"))
     if not files:
         sys.exit(f"No .mkv files in {folder}")
     os.makedirs(cfg.WORK_DIR, exist_ok=True)
+
+    parsed = [(f, parse_episode_filename(f.name)) for f in files]
+    named = [(f, info) for f, info in parsed if info]
+    if named:
+        unnamed = [f.name for f, info in parsed if not info]
+        if unnamed:
+            sys.exit("Some files are named as episodes and some aren't - name these as "
+                     "'Show - SxxEyy - Title.mkv' too, or move them out:\n  "
+                     + "\n  ".join(unnamed))
+        shows_seasons = {(show, season) for _, (show, season, _) in named}
+        if len(shows_seasons) > 1:
+            sys.exit("The files are for more than one show or season - process one at a time:\n  "
+                     + "\n  ".join(f"{show} season {season}" for show, season in sorted(shows_seasons)))
+        send_named_episodes(named)
+        return
 
     show_name = prompt_required("Show name:", "show name", None)
     if show_name is None:
@@ -1263,8 +1335,9 @@ if __name__ == "__main__":
         description="Watch for discs, then rip, encode and send them to the media server.")
     parser.add_argument(
         "--from-folder", metavar="DIR",
-        help="process existing TV episode .mkv files in DIR (number, encode, send) "
-             "instead of watching for discs",
+        help="encode and send existing TV episode .mkv files in DIR instead of watching "
+             "for discs - files named 'Show - SxxEyy - Title.mkv' are sent as named, "
+             "MakeMKV's 'title_tNN.mkv' files are picked and numbered like a disc",
     )
     args = parser.parse_args()
     if args.from_folder:
