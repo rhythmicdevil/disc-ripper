@@ -78,7 +78,11 @@ Leave the terminal open. Insert a disc:
   the *longest* title over the minimum length (`MAKEMKV_MIN_LENGTH_SECONDS`
   in `config.py`, defaults to 65 min) - usually the movie itself. If two
   different titles tie for longest, you're asked to pick.
-- **TV Show**: enter the show name and season number. The script then
+- **TV Show**: enter the show name and season number, an optional TMDB
+  show ID, and optionally **which episodes are on the disc** (e.g. `5-8`).
+  The range is pre-filled with the next disc's worth (same size as the last
+  range) while you stay on the same show and season; leave it blank to have
+  everything worked out as below. The script then
   reads the disc's title list and **picks the episodes itself**:
   - Titles that play the same video as another title are dropped. Blu-rays
     often list each episode under several playlists that differ only in
@@ -105,6 +109,18 @@ Leave the terminal open. Insert a disc:
     one file per episode where the clips join, copying rather than
     re-encoding. That takes about twice the title's size in `WORK_DIR`
     for a moment. The episodes are numbered in play order.
+  - If you entered a range, the pick is then made to hold exactly that many
+    episodes. Too many titles: the ones furthest from the usual episode
+    length are dropped (a featurette that runs as long as an episode).
+    Too few: longer titles are added, closest in length first. That covers
+    an episode that runs long and misses the matching group, like Buffy's
+    musical. A title about twice the usual length (1.7x or more) counts as a
+    double episode and is named `S06E01-E02`, with both TMDB titles.
+    Shorter titles and Play Alls are never added. If no set of titles adds
+    up to the range, you get the checklist below, with a reminder of the
+    count. (A double episode whose length happens to equal two other
+    episodes added together looks just like a Play All, so it ends up there
+    too.)
   - If that's not conclusive either (fewer than `EPISODE_DETECT_MIN_TITLES` titles
     match, or another group comes within 70% of the winner's total running
     time), the disc is rescanned
@@ -115,7 +131,8 @@ Leave the terminal open. Insert a disc:
     best guess pre-ticked.
   The ripped episodes are then **numbered automatically**, ordered by the
   disc's playlist/file numbers (`00071.mpls`, `VTS_04_1.VOB`) when each
-  title has a distinct one, otherwise by MakeMKV's title order. Since a
+  title has a distinct one, otherwise by MakeMKV's title order. With a
+  range entered, numbering starts at its first episode. Without one, since a
   season usually spans several discs, numbering continues from what's
   already on the media server: the script lists the season folder over SSH
   and starts this disc after the highest `SxxEyy` episode it finds (at 1 if
@@ -167,8 +184,8 @@ changed or deleted either way.
   episode or anything else you've numbered by hand goes through untouched.
   Every file needs a name like this, for the same show and season;
   otherwise the script stops and lists the ones that don't fit.
-- **MakeMKV's own names** (`title_t00.mkv`): it asks for the show name and
-  season, then does everything the watcher does after ripping: picks the
+- **MakeMKV's own names** (`title_t00.mkv`): it asks for the show name,
+  season and optional episode range, then does everything the watcher does after ripping: picks the
   episodes by matching length (so a Play All or extras ripped along with
   them are skipped, with the same one-time checklist if it can't tell),
   numbers them on from what's already on the server, names them from TMDB,

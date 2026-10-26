@@ -354,13 +354,16 @@ def guess_episode_order(mkv_files, titles):
     recovered from its default '..._t<NN>.mkv' output naming. A title whose
     chapter count differs from the other episodes is flagged as low
     confidence. Discs get authored in all kinds of orders, so this is a
-    best guess, never a final answer.
+    best guess, never a final answer. A title marked as a double episode
+    (episode_span 2 - see mark_double_episodes) takes up two numbers, and
+    isn't held to the other episodes' chapter count.
 
-    Returns a list of (path, guessed_offset, confidence, reason) - one
+    Returns a list of (path, guessed_offset, span, confidence, reason) - one
     entry per file in mkv_files, ordered by the guess (files MakeMKV's
     naming couldn't be matched to a title go last, sorted by duration).
     guessed_offset is 0-based (add the disc's first episode number - see
-    highest_episode_on_server); it's None when nothing could be guessed."""
+    highest_episode_on_server); it's None when nothing could be guessed.
+    span is how many episodes the file holds."""
     matched = []
     unmatched = []
     for f in mkv_files:
@@ -375,6 +378,7 @@ def guess_episode_order(mkv_files, titles):
             "title_index": title_index,
             "source_number": source_file_number(info.get("source_filename")),
             "chapter_count": info.get("chapter_count"),
+            "span": info.get("episode_span", 1),
         })
 
     source_numbers = [c["source_number"] for c in matched]
@@ -385,26 +389,30 @@ def guess_episode_order(mkv_files, titles):
         matched.sort(key=lambda c: c["title_index"])
         base_confidence, base_reason = "medium", "disc title order"
 
-    chapter_counts = [c["chapter_count"] for c in matched if c["chapter_count"]]
+    chapter_counts = [c["chapter_count"] for c in matched if c["chapter_count"] and c["span"] == 1]
     mode_chapter_count = max(set(chapter_counts), key=chapter_counts.count) if chapter_counts else None
 
     results = []
-    for offset, c in enumerate(matched):
+    offset = 0
+    for c in matched:
         reasons = [base_reason]
         confidence = base_confidence
 
-        if mode_chapter_count is not None and c["chapter_count"] not in (None, mode_chapter_count):
+        if c["span"] > 1:
+            reasons.append("about twice as long as the other episodes, so a double episode")
+        elif mode_chapter_count is not None and c["chapter_count"] not in (None, mode_chapter_count):
             confidence = "low"
             reasons.append(
                 f"chapter count ({c['chapter_count']}) differs from the "
                 f"other {mode_chapter_count}-chapter episodes"
             )
 
-        results.append((c["path"], offset, confidence, ", ".join(reasons)))
+        results.append((c["path"], offset, c["span"], confidence, ", ".join(reasons)))
+        offset += c["span"]
 
     unmatched.sort(key=get_duration_seconds, reverse=True)
     for f in unmatched:
-        results.append((f, None, "low", "couldn't match this file back to a disc title"))
+        results.append((f, None, 1, "low", "couldn't match this file back to a disc title"))
 
     return results
 
@@ -607,6 +615,39 @@ def prompt_tmdb_show_id(default_id=None):
         return int(value.strip())
     notify(f"'{value}' isn't a valid TMDB id - looking it up by name instead.")
     return None
+
+
+def parse_episode_range(value):
+    """'5-8' (or '5 to 8') -> (5, 8), and a single '5' -> (5, 5). Returns
+    None if value isn't a range like that."""
+    match = re.fullmatch(r"\s*(\d+)\s*(?:(?:-|–|to)\s*(\d+)\s*)?", value or "", re.IGNORECASE)
+    if not match:
+        return None
+    first = int(match.group(1))
+    last = int(match.group(2)) if match.group(2) else first
+    return (first, last) if 1 <= first <= last else None
+
+
+def prompt_episode_range(default_range=None):
+    """Asks which episodes are on the disc, e.g. '5-8' - optional. When
+    given, the number of episodes narrows down which titles get ripped (see
+    fit_episode_count), and numbering starts at the first one instead of
+    after the highest episode on the server. The entry is pre-filled with
+    default_range ((first, last)) if given.
+    Returns (first, last), or None (pick the titles and numbers
+    automatically, same as before this existed) if left blank, cancelled,
+    or not a valid range."""
+    value = zenity_entry(
+        "Episodes on this disc, e.g. 5-8 (optional - leave blank to work it out "
+        "from the disc and the server):",
+        default_text=f"{default_range[0]}-{default_range[1]}" if default_range else None,
+    )
+    if not value:
+        return None
+    episode_range = parse_episode_range(value)
+    if episode_range is None:
+        notify(f"'{value}' isn't a valid episode range - working it out automatically instead.")
+    return episode_range
 
 
 def is_bluray_title(info):
@@ -895,10 +936,88 @@ def detect_episode_titles(titles, pad_seconds):
     return max([best] + close, key=average_length), False
 
 
-def ask_episode_titles(titles, suggested, disc_errors, device):
+# A title at least this many times the usual episode length is counted as a
+# double episode (e.g. a two-part premiere authored as one title).
+DOUBLE_EPISODE_RATIO = 1.7
+
+
+def typical_length(titles, indices):
+    """The usual episode length among indices - the median, taking the
+    lower middle one for an even count so a double episode in a pair
+    doesn't count as the norm."""
+    lengths = sorted(titles[i]["duration_seconds"] for i in indices)
+    return lengths[(len(lengths) - 1) // 2]
+
+
+def mark_double_episodes(titles, indices):
+    """Sets titles[i]["episode_span"] to 2 for each of indices that runs
+    about twice as long as the others (see DOUBLE_EPISODE_RATIO), so it's
+    numbered as two episodes (see guess_episode_order), and to 1 for the
+    rest. Returns the total number of episodes the titles hold."""
+    typical = typical_length(titles, indices)
+    for i in indices:
+        double = titles[i]["duration_seconds"] >= DOUBLE_EPISODE_RATIO * typical
+        titles[i]["episode_span"] = 2 if double else 1
+    return sum(titles[i]["episode_span"] for i in indices)
+
+
+def fit_episode_count(titles, best, episode_count, pad_seconds):
+    """Narrows the detected episodes (best, from detect_episode_titles)
+    down to, or out to, the episode_count the user said is on the disc. A
+    double episode (see mark_double_episodes) counts as two.
+    - Too many: the titles furthest from the usual episode length are
+      dropped (featurettes that happen to run as long as an episode).
+    - Too few: other titles at least as long as the episodes are added,
+      closest in length first - an episode that runs long, like a musical
+      or a double episode, misses the matching group by more than the
+      padding. A title that's a "Play All" of others (see is_play_all) is
+      never added, and shorter ones aren't either, since those are extras.
+    If best is empty, the episode_count longest titles stand in for it.
+    Returns the sorted title indices (with episode_span set on them), or
+    None if no set of titles adds up to exactly episode_count."""
+    candidates = [i for i, info in titles.items()
+                  if info.get("duration_seconds", 0) >= cfg.EPISODE_DETECT_MIN_SECONDS]
+    if not candidates:
+        return None
+    chosen = list(best) or sorted(
+        candidates, key=lambda i: titles[i]["duration_seconds"])[-episode_count:]
+    typical = typical_length(titles, chosen)
+
+    def distance(i):
+        return abs(titles[i]["duration_seconds"] - typical)
+
+    def count(indices):
+        return mark_double_episodes(titles, indices) if indices else 0
+
+    while count(chosen) > episode_count:
+        chosen.remove(max(chosen, key=distance))
+
+    others = [titles[i]["duration_seconds"] for i in candidates]
+    extra = sorted(
+        (i for i in candidates
+         if i not in chosen
+         and titles[i]["duration_seconds"] >= typical - pad_seconds
+         and not is_play_all(titles[i]["duration_seconds"],
+                             [d for j, d in zip(candidates, others) if j != i])),
+        key=distance,
+    )
+    for i in extra:
+        if count(chosen) >= episode_count:
+            break
+        if count(chosen + [i]) <= episode_count:
+            chosen.append(i)
+
+    if count(chosen) != episode_count:
+        return None
+    return sorted(chosen)
+
+
+def ask_episode_titles(titles, suggested, disc_errors, device, episode_count=None):
     """Asks the user, in a single checklist, which disc titles are episodes.
     Every title is listed with its length and chapter count, and the
-    suggested titles are pre-ticked. Returns the chosen title indices, or None if the
+    suggested titles are pre-ticked. episode_count, if given, is how many
+    episodes the user said are on the disc, and is shown as a reminder.
+    Returns the chosen title indices, or None if the
     user cancels or ticks nothing (the disc has already been ejected by
     then)."""
     rows = []
@@ -911,10 +1030,15 @@ def ask_episode_titles(titles, suggested, disc_errors, device):
             str(info.get("chapter_count") or ""),
             info.get("name", ""),
         ]
+    if episode_count:
+        reason = (f"Couldn't find titles adding up to the {episode_count} episode(s) you entered "
+                  "(a title twice as long counts as two).")
+    else:
+        reason = "Couldn't tell which titles are the episodes from their lengths."
     result = subprocess.run(
         ["zenity", "--list", "--checklist", "--title", "Disc Ripper",
-         "--text", "Couldn't tell which titles are the episodes from their lengths.\n"
-                   "Tick the titles to rip as episodes:" + format_makemkv_errors(disc_errors),
+         "--text", reason + "\nTick the titles to rip as episodes:"
+                   + format_makemkv_errors(disc_errors),
          "--column", "Rip", "--column", "Title", "--column", "Length",
          "--column", "Chapters", "--column", "Name",
          "--print-column=2", "--separator= ", "--width=600", "--height=450",
@@ -928,11 +1052,14 @@ def ask_episode_titles(titles, suggested, disc_errors, device):
     return chosen
 
 
-def choose_episode_titles(titles, disc_errors, device):
+def choose_episode_titles(titles, disc_errors, device, episode_count=None):
     """Picks the disc title indices to rip as episodes. They're picked
     automatically by matching lengths (see detect_episode_titles, with
-    cfg.EPISODE_LENGTH_PAD_MINUTES as the tolerance). If that's not
-    conclusive, the disc is rescanned (up to RESCAN_ATTEMPTS times) - read
+    cfg.EPISODE_LENGTH_PAD_MINUTES as the tolerance). If the user said how
+    many episodes are on the disc (episode_count), the pick is narrowed
+    down or out to that many (see fit_episode_count), and it only counts as
+    settled if that works out. If it's not conclusive, the disc is
+    rescanned (up to RESCAN_ATTEMPTS times) - read
     errors on a scratched disc can make MakeMKV drop titles it already
     found, or the drive reset mid-scan, but a later scan often reads it
     fine. The scan with the most titles is used, and the user is asked,
@@ -942,14 +1069,24 @@ def choose_episode_titles(titles, disc_errors, device):
     "Play All" title is checked for (see find_play_all_split) - then that
     title is ripped and cut into episodes instead.
     Returns (title_indices, titles, split), where titles is the scan
-    actually used and split is None or the (clip_seconds, episode_clips)
+    actually used (with episode_span set on the chosen titles when
+    episode_count is given - see mark_double_episodes) and split is None or the (clip_seconds, episode_clips)
     to cut the single ripped title at (see split_play_all) - or None if
     there's nothing to rip (the disc has already been ejected by then)."""
     pad_seconds = cfg.EPISODE_LENGTH_PAD_MINUTES * 60
-    best, certain = detect_episode_titles(drop_duplicate_titles(titles), pad_seconds)
+
+    def detect(titles):
+        deduped = drop_duplicate_titles(titles)
+        best, certain = detect_episode_titles(deduped, pad_seconds)
+        if not episode_count:
+            return best, certain
+        fitted = fit_episode_count(deduped, best, episode_count, pad_seconds)
+        return (fitted, True) if fitted else (best, False)
+
+    best, certain = detect(titles)
     if not certain:
         play_all = find_play_all_split(drop_duplicate_titles(titles), device, pad_seconds)
-        if play_all:
+        if play_all and (not episode_count or len(play_all[2]) == episode_count):
             idx, clip_seconds, episode_clips = play_all
             lengths = ", ".join(f"{clip_seconds[c] / 60:.0f}" for c in episode_clips)
             print(f"Title {idx} is a Play All of {len(episode_clips)} episode(s) with no titles "
@@ -966,7 +1103,7 @@ def choose_episode_titles(titles, disc_errors, device):
         if len(rescanned) > len(titles):
             print(f"Rescan found {len(rescanned)} title(s) - using it")
             titles, disc_errors = rescanned, rescan_errors
-            best, certain = detect_episode_titles(drop_duplicate_titles(titles), pad_seconds)
+            best, certain = detect(titles)
 
     if not titles:
         notify("MakeMKV couldn't read any titles from this disc - "
@@ -979,8 +1116,13 @@ def choose_episode_titles(titles, disc_errors, device):
 
     # Don't eject before asking - the disc is still needed to rip the choice.
     ring_bell()
-    chosen = ask_episode_titles(drop_duplicate_titles(titles), best, disc_errors, device)
-    return (chosen, titles, None) if chosen else None
+    chosen = ask_episode_titles(drop_duplicate_titles(titles), best, disc_errors, device,
+                                episode_count)
+    if not chosen:
+        return None
+    if episode_count:
+        mark_double_episodes(titles, chosen)
+    return chosen, titles, None
 
 
 def handle_movie(raw_dir, title, year, device):
@@ -1006,7 +1148,7 @@ def handle_movie(raw_dir, title, year, device):
     return success
 
 
-def handle_tv(mkv_files, show_name, season_num, device, titles, tmdb_id=None):
+def handle_tv(mkv_files, show_name, season_num, device, titles, tmdb_id=None, first_episode=None):
     """Encodes and sends every chosen episode. Returns True only if all of
     them made it to the server - the caller uses this to decide whether the
     raw rip is safe to delete, so a partial failure (e.g. a GPU driver
@@ -1015,7 +1157,11 @@ def handle_tv(mkv_files, show_name, season_num, device, titles, tmdb_id=None):
     tmdb_id, if given, is used as the show's TMDB id as-is instead of
     searching for it by name - some shows have several TMDB entries (e.g. a
     remake sharing a near-identical title) where the name search finds the
-    wrong one and tags episodes with another show's names."""
+    wrong one and tags episodes with another show's names.
+
+    first_episode, if given (the start of the episode range the user
+    entered), is the first file's episode number. Otherwise numbering
+    continues after the highest episode already on the server."""
     if not mkv_files:
         notify("No files were ripped - check MakeMKV output.", device=device)
         return False
@@ -1026,14 +1172,17 @@ def handle_tv(mkv_files, show_name, season_num, device, titles, tmdb_id=None):
 
     # Earlier discs of this season may already be on the server - continue
     # numbering after the highest episode there instead of restarting at 1.
-    highest = highest_episode_on_server(remote_season_dir, season_num)
-    first_episode = (highest or 0) + 1
-    if highest is None:
+    highest = None if first_episode else highest_episode_on_server(remote_season_dir, season_num)
+    if first_episode:
+        start_note = f"starting at episode {first_episode} as entered"
+    elif highest is None:
         start_note = "couldn't reach the server to check for earlier discs, so starting at 1"
     elif highest:
         start_note = f"episodes up to {highest} are already on the server"
     else:
         start_note = "no episodes of this season on the server yet"
+    if not first_episode:
+        first_episode = (highest or 0) + 1
     # Looked up once per disc rather than per episode - it's the same show
     # for every file, no need to hit TMDB's search endpoint repeatedly.
     show_id = tmdb_id if tmdb_id is not None else tmdb_find_show_id(show_name)
@@ -1044,12 +1193,13 @@ def handle_tv(mkv_files, show_name, season_num, device, titles, tmdb_id=None):
     # missing. All of this happens before encoding starts, so the whole
     # batch can run unattended.
     episodes = []
-    for f, offset, confidence, reason in guesses:
+    for f, offset, span, confidence, reason in guesses:
         guessed_num = offset + first_episode if offset is not None else None
         if guessed_num is not None and confidence != "low":
-            print(f"{f.name} -> episode {guessed_num} ({confidence} confidence: {reason}; "
+            numbers = f"s {guessed_num}-{guessed_num + span - 1}" if span > 1 else f" {guessed_num}"
+            print(f"{f.name} -> episode{numbers} ({confidence} confidence: {reason}; "
                   f"{start_note})")
-            episodes.append((f, guessed_num))
+            episodes.append((f, guessed_num, span))
             continue
 
         duration_min = get_duration_seconds(f) / 60
@@ -1070,7 +1220,7 @@ def handle_tv(mkv_files, show_name, season_num, device, titles, tmdb_id=None):
             notify(f"'{episode}' isn't a valid episode number - skipping {f.name}.")
             continue
 
-        episodes.append((f, episode_num))
+        episodes.append((f, episode_num, span))
 
     total = len(episodes)
     if total == 0:
@@ -1078,13 +1228,16 @@ def handle_tv(mkv_files, show_name, season_num, device, titles, tmdb_id=None):
         return False
 
     transferred = []
-    for f, episode_num in episodes:
+    for f, episode_num, span in episodes:
         # Only look up the episode title once the number is confirmed -
         # there's no point querying TMDB for a number that might still change.
-        episode_title = tmdb_get_episode_title(show_id, season_num, episode_num)
-        title_suffix = f" - {sanitize(episode_title)}" if episode_title else ""
+        numbers = range(episode_num, episode_num + span)
+        episode_titles = [t for n in numbers if (t := tmdb_get_episode_title(show_id, season_num, n))]
+        title_suffix = f" - {sanitize(' & '.join(episode_titles))}" if episode_titles else ""
 
-        episode_filename = f"{show_name} S{season_num:02d}E{episode_num:02d}{title_suffix}.mkv"
+        # A double episode is named "S06E01-E02", which Jellyfin understands.
+        episode_tag = "-".join(f"E{n:02d}" for n in numbers)
+        episode_filename = f"{show_name} S{season_num:02d}{episode_tag}{title_suffix}.mkv"
         encoded_path = Path(cfg.ENCODED_DIR) / show_name / season_folder / episode_filename
 
         label = f"{episode_filename} ({len(transferred) + 1} of {total})"
@@ -1108,6 +1261,7 @@ def main():
     last_show_name = None
     last_season_num = None
     last_tmdb_id = None
+    last_episode_range = None
 
     try:
         while True:
@@ -1151,10 +1305,22 @@ def main():
                 # A TMDB id only carries over while it's the same show -
                 # another show's id would tag episodes with the wrong names.
                 same_show = show_name == last_show_name
+                same_season = same_show and season_num == last_season_num
                 last_show_name, last_season_num = show_name, season_num
 
                 tmdb_id = prompt_tmdb_show_id(last_tmdb_id if same_show else None)
                 last_tmdb_id = tmdb_id
+
+                # Suggests the next disc's worth of episodes, assuming it
+                # holds as many as the last one did.
+                next_range = None
+                if same_season and last_episode_range:
+                    first, last = last_episode_range
+                    next_range = (last + 1, 2 * last - first + 1)
+                episode_range = prompt_episode_range(next_range)
+                last_episode_range = episode_range
+                episode_count = episode_range[1] - episode_range[0] + 1 if episode_range else None
+                first_episode = episode_range[0] if episode_range else None
 
             if not wait_for_makemkv_gui_closed(device):
                 continue
@@ -1178,7 +1344,7 @@ def main():
                 else:
                     # Needs the disc's title list, so this runs after
                     # get_disc_titles rather than with the up-front prompts.
-                    chosen = choose_episode_titles(titles, disc_errors, device)
+                    chosen = choose_episode_titles(titles, disc_errors, device, episode_count)
                     if chosen is None:
                         continue
                     episode_indices, titles, split = chosen
@@ -1197,7 +1363,7 @@ def main():
                     all_done = handle_movie(raw_dir, title, year, device)
                 else:
                     all_done = handle_tv(list(Path(raw_dir).glob("*.mkv")), show_name, season_num,
-                                          device, titles, tmdb_id)
+                                          device, titles, tmdb_id, first_episode)
 
             # Only reclaim the raw rip once everything in it has been
             # encoded and sent - a failed rip, encode or transfer (e.g. the
@@ -1310,12 +1476,18 @@ def process_folder(folder):
     if season_num is None:
         return
     tmdb_id = prompt_tmdb_show_id()
+    episode_range = prompt_episode_range()
+    episode_count = episode_range[1] - episode_range[0] + 1 if episode_range else None
 
     # Keyed by position in `files`, shaped like get_disc_titles' output so
     # the disc-title helpers work on it.
     titles = {i: {"duration_seconds": int(get_duration_seconds(f)), "name": f.name}
               for i, f in enumerate(files)}
-    best, certain = detect_episode_titles(titles, cfg.EPISODE_LENGTH_PAD_MINUTES * 60)
+    pad_seconds = cfg.EPISODE_LENGTH_PAD_MINUTES * 60
+    best, certain = detect_episode_titles(titles, pad_seconds)
+    if episode_count:
+        fitted = fit_episode_count(titles, best, episode_count, pad_seconds)
+        best, certain = (fitted, True) if fitted else (best, False)
     if certain:
         chosen = best
         skipped = [files[i].name for i in titles if i not in best]
@@ -1323,11 +1495,21 @@ def process_folder(folder):
             print(f"Skipping {len(skipped)} file(s) that don't match the episode length: "
                   + ", ".join(skipped))
     else:
-        chosen = ask_episode_titles(titles, best, [], None)
+        chosen = ask_episode_titles(titles, best, [], None, episode_count)
         if not chosen:
             return
+        if episode_count:
+            mark_double_episodes(titles, chosen)
 
-    handle_tv([files[i] for i in chosen], sanitize(show_name), season_num, None, {}, tmdb_id)
+    # guess_episode_order finds a file's title by the _t<NN> in its name,
+    # so double episodes are passed on keyed by that.
+    spans = {}
+    for i in chosen:
+        match = TITLE_INDEX_RE.search(files[i].name)
+        if match:
+            spans[int(match.group(1))] = {"episode_span": titles[i].get("episode_span", 1)}
+    handle_tv([files[i] for i in chosen], sanitize(show_name), season_num, None, spans, tmdb_id,
+              episode_range[0] if episode_range else None)
 
 
 if __name__ == "__main__":
